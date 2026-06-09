@@ -29,34 +29,35 @@ Output protocol — your FINAL line must be one of:
 
 The orchestrator will re-run verification after you push. If it passes, you're done. If it still fails and retries remain, you'll be invoked again with the new output.`;
 
-const FOLLOWUP_SUBAGENT_SYSTEM_PROMPT = `You are continuing work on a PR that has already been opened for a Linear ticket. A reviewer has commented on the PR and you need to respond on the PR.
+const FOLLOWUP_SUBAGENT_SYSTEM_PROMPT = `You are continuing work on a PR that has already been opened for a Linear ticket. A reviewer has commented on the PR and you need to respond.
 
 Your cwd is a freshly checked-out worktree on the same branch as the PR — your previous commits are already there. The session has been resumed, so you remember the original plan.
 
 Do this:
 1. Re-read CLAUDE.md and README.md in case anything has changed.
 2. Read the reviewer's comment carefully. Decide: does it require code changes, or is it a question/discussion?
-3. If code changes are needed: implement them, run lint/format/typecheck/tests, commit, then \`git push origin HEAD\`. The existing PR will auto-update.
-4. Post a reply on the PR with \`gh pr comment <PR_NUMBER> --body "..."\` (the PR number is in your user prompt). Your reply:
-   - Should directly address the reviewer's specific point — this is a real conversation, not a status report.
-   - If you pushed code: briefly say what you changed.
-   - If no code change: explain why you decided not to change anything, or ask for clarification if the comment was ambiguous.
-   - Keep it conversational and concise. Don't quote the reviewer back at them. Don't add boilerplate like "Thank you for the feedback".
-   - Use \`--body-file\` (or a heredoc) if the reply has multiple lines, to avoid shell quoting issues.
+3. If code changes are needed: implement them, run lint/format/typecheck/tests, commit, then push. Your HEAD is detached (so the user can have the same branch checked out elsewhere) — push with the explicit refspec in your user prompt. The existing PR will auto-update.
+4. Do NOT post a comment on the PR yourself. The orchestrator will post your reply for you, using the text after the protocol marker on your final line (see below). Just make that reply text good.
+
+The reply text the orchestrator posts:
+- Directly addresses the reviewer's specific point — this is a real conversation.
+- If you pushed code: briefly say what you changed.
+- If no code change: explain why, or ask for clarification.
+- Conversational and concise. Don't quote the reviewer back at them. No "Thanks for the feedback".
 
 Hard rules:
 - Do NOT push to or modify the base branch (${config.BASE_BRANCH}).
 - Do NOT amend or force-push.
 - Do NOT touch .git/config.
 - Do NOT skip hooks (--no-verify).
-- Post the PR comment exactly once.
+- Do NOT run \`gh pr comment\` or \`gh api\` to post a comment — the orchestrator handles posting.
 
 Output protocol — your FINAL line must be one of:
-- \`UPDATED: <one-line summary>\`  if you pushed new commits
-- \`NO_CHANGES: <one-line explanation>\`  if you decided no code change was warranted
-- \`BLOCKED: <reason>\`  if you cannot proceed and a human needs to intervene
+- \`UPDATED: <reply text>\`  if you pushed new commits. The reply text is what gets posted on the PR.
+- \`NO_CHANGES: <reply text>\`  if no code change was warranted. The reply text is what gets posted on the PR.
+- \`BLOCKED: <reason>\`  if a human needs to intervene. The reason gets posted on the PR.
 
-Nothing after that line.`;
+Keep the text after the marker to ~1–3 sentences. Plain prose, no leading "Updated:" or "Reply:". Nothing after that line.`;
 
 const SUBAGENT_SYSTEM_PROMPT = `You are an execution agent. The plan in your prompt has been approved by the user. Your cwd is a fresh git worktree on a dedicated branch for this Linear ticket.
 
@@ -524,25 +525,37 @@ async function runFollowup(issueId: string, commenter: string, commentBody: stri
   const branch = branchFor(ctx.identifier);
   const worktreePath = path.join(config.WORKTREE_ROOT, ctx.identifier);
 
+  const prRepo = ticket.pr_repo!;
+  const prNumber = ticket.pr_number!;
+
   console.log(`[followup] ${ctx.identifier}: rehydrating worktree for PR comment from ${commenter}`);
   try {
     await prepareFollowupWorktree(branch, worktreePath);
   } catch (err) {
     console.error(`[followup] ${ctx.identifier}: worktree rehydration failed: ${(err as Error).message}`);
-    await postComment(issueId, `Could not respond to PR feedback from @${commenter}: worktree rehydration failed (${(err as Error).message})`);
+    await tryPostPrComment(
+      prRepo,
+      prNumber,
+      `Could not act on this comment: worktree rehydration failed (${(err as Error).message}).`,
+      ctx.identifier,
+    );
     return;
   }
 
   const prompt = `# Reviewer feedback on PR ${ticket.pr_url}
 
-PR_NUMBER: ${ticket.pr_number}
-PR_REPO: ${ticket.pr_repo}
-
 From @${commenter}:
 
 > ${commentBody.replace(/\n/g, '\n> ')}
 
-Address this and reply on the PR via \`gh pr comment ${ticket.pr_number}\`. End with UPDATED: <summary>, NO_CHANGES: <reason>, or BLOCKED: <reason> on the final line.`;
+Address this. The orchestrator will post your reply on the PR — do NOT post one yourself.
+
+If you need to push commits, your HEAD is detached. Push with:
+\`\`\`
+git push origin HEAD:${branch}
+\`\`\`
+
+End with UPDATED: <reply text>, NO_CHANGES: <reply text>, or BLOCKED: <reason> on the final line.`;
 
   const model = ticket.last_plan ? extractRecommendedModel(ticket.last_plan) : undefined;
   let result: ClaudeResult;
@@ -556,38 +569,109 @@ Address this and reply on the PR via \`gh pr comment ${ticket.pr_number}\`. End 
     });
   } catch (err) {
     await cleanupWorktree(worktreePath, branch);
-    await postComment(issueId, `Follow-up subagent crashed responding to @${commenter}: ${(err as Error).message}`);
+    await tryPostPrComment(
+      prRepo,
+      prNumber,
+      `Follow-up subagent crashed: ${(err as Error).message}`,
+      ctx.identifier,
+    );
     return;
   }
 
   if (result.is_error || !result.result) {
     await cleanupWorktree(worktreePath, branch);
-    await postComment(issueId, `Follow-up subagent returned error responding to @${commenter}: ${JSON.stringify(result)}`);
+    await tryPostPrComment(
+      prRepo,
+      prNumber,
+      `Follow-up subagent returned error: ${JSON.stringify(result)}`,
+      ctx.identifier,
+    );
     return;
   }
 
   // Persist the new session id so the conversation thread keeps growing across follow-ups.
-  savePrInfo(issueId, ticket.pr_url, ticket.pr_repo!, ticket.pr_number!, result.session_id);
+  savePrInfo(issueId, ticket.pr_url, prRepo, prNumber, result.session_id);
 
   const outcome = parseFollowupOutcome(result.result);
   await cleanupWorktree(worktreePath, branch);
 
   const auditPrefix = `[audit] PR feedback from @${commenter} on ${ticket.pr_url} —`;
+
   if (outcome.kind === 'updated') {
-    await postComment(issueId, `${auditPrefix} pushed update: ${outcome.summary} (cost: $${result.total_cost_usd ?? '?'})`);
+    const r = await tryPostPrComment(prRepo, prNumber, outcome.summary, ctx.identifier);
+    await postComment(issueId, `${auditPrefix} pushed update: ${outcome.summary}${prPostNote(r)} (cost: $${result.total_cost_usd ?? '?'})`);
     console.log(`[followup] ${ctx.identifier}: updated — ${outcome.summary}`);
   } else if (outcome.kind === 'no_changes') {
-    await postComment(issueId, `${auditPrefix} no code change: ${outcome.reason}`);
+    const r = await tryPostPrComment(prRepo, prNumber, outcome.reason, ctx.identifier);
+    await postComment(issueId, `${auditPrefix} no code change: ${outcome.reason}${prPostNote(r)}`);
     console.log(`[followup] ${ctx.identifier}: no_changes — ${outcome.reason}`);
   } else if (outcome.kind === 'blocked') {
-    await postComment(issueId, `${auditPrefix} blocked: ${outcome.reason}`);
+    const r = await tryPostPrComment(prRepo, prNumber, `Blocked: ${outcome.reason}`, ctx.identifier);
+    await postComment(issueId, `${auditPrefix} blocked: ${outcome.reason}${prPostNote(r)}`);
     console.log(`[followup] ${ctx.identifier}: blocked — ${outcome.reason}`);
   } else {
+    const r = await tryPostPrComment(
+      prRepo,
+      prNumber,
+      `Subagent finished without an UPDATED/NO_CHANGES/BLOCKED marker — see Linear ticket for details.`,
+      ctx.identifier,
+    );
     await postComment(
       issueId,
-      `${auditPrefix} subagent finished without UPDATED/NO_CHANGES/BLOCKED marker. Last 500 chars:\n${result.result.slice(-500)}`,
+      `${auditPrefix} subagent finished without UPDATED/NO_CHANGES/BLOCKED marker.${prPostNote(r)} Last 500 chars:\n${result.result.slice(-500)}`,
     );
   }
+}
+
+interface PrPostResult {
+  ok: boolean;
+  error?: string;
+}
+
+function prPostNote(r: PrPostResult): string {
+  return r.ok ? '' : `\n\n_(failed to post reply on PR: ${r.error})_`;
+}
+
+async function tryPostPrComment(
+  repo: string,
+  number: number,
+  body: string,
+  identifier: string,
+): Promise<PrPostResult> {
+  try {
+    await postPrComment(repo, number, body);
+    console.log(`[followup] ${identifier}: posted reply on PR ${repo}#${number}`);
+    return { ok: true };
+  } catch (err) {
+    const msg = (err as Error).message;
+    console.error(`[followup] ${identifier}: failed to post PR reply: ${msg}`);
+    return { ok: false, error: msg };
+  }
+}
+
+function postPrComment(repo: string, number: number, body: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      'gh',
+      ['pr', 'comment', String(number), '--repo', repo, '--body-file', '-'],
+      {
+        env: {
+          ...process.env,
+          ...(config.GITHUB_TOKEN
+            ? { GITHUB_TOKEN: config.GITHUB_TOKEN, GH_TOKEN: config.GITHUB_TOKEN }
+            : {}),
+        },
+      },
+    );
+    let stderr = '';
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`gh pr comment exited ${code}: ${stderr}`));
+    });
+    child.on('error', reject);
+    child.stdin.end(body);
+  });
 }
 
 async function prepareFollowupWorktree(branch: string, worktreePath: string): Promise<void> {
@@ -596,14 +680,11 @@ async function prepareFollowupWorktree(branch: string, worktreePath: string): Pr
     // Leftover from a previous failed run — clean it.
     await cleanupWorktree(worktreePath, branch);
   }
-  // Defensive: branch may exist locally if cleanup partially failed.
-  try {
-    await runGit(['branch', '-D', branch]);
-  } catch {
-    // Branch didn't exist — that's the expected case.
-  }
   await runGit(['fetch', '--prune', 'origin']);
-  await runGit(['worktree', 'add', worktreePath, '-b', branch, `origin/${branch}`]);
+  // Detached HEAD — never conflicts with whatever the user has checked out
+  // at REPO_PATH (including this same branch). The subagent must push with an
+  // explicit refspec (HEAD:<branch>); see FOLLOWUP_SUBAGENT_SYSTEM_PROMPT.
+  await runGit(['worktree', 'add', '--detach', worktreePath, `origin/${branch}`]);
 }
 
 async function fail(
