@@ -21,6 +21,14 @@ const schema = z
     VERIFICATION_TIMEOUT_MS: z.coerce.number().default(10 * 60 * 1000),
     VERIFICATION_MAX_RETRIES: z.coerce.number().default(2),
     PLANNER_MODEL: z.string().default('opus'),
+    // Cumulative spend cap per Linear ticket across all planner / executor /
+    // verification-fix / follow-up runs. 0 = no cap.
+    MAX_COST_USD_PER_TICKET: z.coerce.number().default(0),
+    // Linear workflow state names. Case-insensitive; resolved per team. If the
+    // state doesn't exist on a given team's workflow, the transition is skipped
+    // with a warning.
+    IN_PROGRESS_STATE_NAME: z.string().default('In Progress'),
+    IN_REVIEW_STATE_NAME: z.string().default('In Review'),
   })
   .transform((c) => ({
     ...c,

@@ -2,6 +2,7 @@ import express from 'express';
 import { config } from './config.js';
 import { handleGithubWebhook, verifyGithubSignature } from './github-webhooks.js';
 import { getBotUserId } from './linear.js';
+import { reconcileOrphanedExecutors } from './recovery.js';
 import { handleWebhook, verifyLinearSignature } from './webhooks.js';
 
 const app = express();
@@ -38,5 +39,10 @@ app.listen(config.PORT, async () => {
     console.log(`linear bot user id: ${botId}`);
   } catch (err) {
     console.error('failed to fetch bot user from Linear:', err);
+  }
+  try {
+    await reconcileOrphanedExecutors();
+  } catch (err) {
+    console.error('startup reconciliation failed:', err);
   }
 });

@@ -33,6 +33,8 @@ for (const col of [
   'pr_number INTEGER',
   'executor_session_id TEXT',
   'plan_comment_id TEXT',
+  'total_cost_usd REAL NOT NULL DEFAULT 0',
+  'parent_issue_id TEXT',
 ]) {
   try {
     db.exec(`ALTER TABLE tickets ADD COLUMN ${col}`);
@@ -43,7 +45,7 @@ for (const col of [
 
 db.exec('CREATE INDEX IF NOT EXISTS idx_tickets_pr ON tickets(pr_repo, pr_number)');
 
-export type TicketState = 'planning' | 'executing' | 'done' | 'failed';
+export type TicketState = 'planning' | 'executing' | 'done' | 'failed' | 'split';
 
 export interface TicketRow {
   issue_id: string;
@@ -55,6 +57,8 @@ export interface TicketRow {
   pr_number: number | null;
   executor_session_id: string | null;
   plan_comment_id: string | null;
+  total_cost_usd: number;
+  parent_issue_id: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -127,4 +131,69 @@ export function findTicketByPr(prRepo: string, prNumber: number): TicketRow | un
   return db
     .prepare('SELECT * FROM tickets WHERE pr_repo = ? AND pr_number = ?')
     .get(prRepo, prNumber) as TicketRow | undefined;
+}
+
+/** Add the given cost (USD) to the ticket's cumulative spend and return the new
+ *  total. If the ticket has a parent (B2 child), the parent's total is bumped
+ *  too so the parent ticket always shows the rollup across all its children. */
+export function addCost(issueId: string, deltaUsd: number): number {
+  if (!deltaUsd || deltaUsd <= 0) {
+    const row = db
+      .prepare('SELECT total_cost_usd FROM tickets WHERE issue_id = ?')
+      .get(issueId) as { total_cost_usd: number } | undefined;
+    return row?.total_cost_usd ?? 0;
+  }
+  const row = db
+    .prepare(
+      `UPDATE tickets SET total_cost_usd = total_cost_usd + ?, updated_at = unixepoch()
+       WHERE issue_id = ?
+       RETURNING total_cost_usd, parent_issue_id`,
+    )
+    .get(deltaUsd, issueId) as
+    | { total_cost_usd: number; parent_issue_id: string | null }
+    | undefined;
+  if (row?.parent_issue_id) {
+    db.prepare(
+      `UPDATE tickets SET total_cost_usd = total_cost_usd + ?, updated_at = unixepoch()
+       WHERE issue_id = ?`,
+    ).run(deltaUsd, row.parent_issue_id);
+  }
+  return row?.total_cost_usd ?? 0;
+}
+
+/** List all children of a parent ticket. */
+export function listChildren(parentIssueId: string): TicketRow[] {
+  return db
+    .prepare('SELECT * FROM tickets WHERE parent_issue_id = ?')
+    .all(parentIssueId) as TicketRow[];
+}
+
+/** Persist just the executor session id mid-stream so a crash doesn't lose it. */
+export function setExecutorSessionId(issueId: string, sessionId: string): void {
+  db.prepare(`
+    UPDATE tickets SET executor_session_id = ?, updated_at = unixepoch()
+    WHERE issue_id = ?
+  `).run(sessionId, issueId);
+}
+
+/** List tickets stuck in 'executing' — used by startup reconciliation. */
+export function listExecutingTickets(): TicketRow[] {
+  return db.prepare("SELECT * FROM tickets WHERE state = 'executing'").all() as TicketRow[];
+}
+
+/** Create a child ticket row (for B2 subtask splitting) with last_plan pre-populated. */
+export function createChildTicket(
+  childIssueId: string,
+  parentIssueId: string,
+  lastPlan: string,
+): void {
+  db.prepare(
+    `INSERT INTO tickets (issue_id, state, last_plan, parent_issue_id)
+     VALUES (?, 'executing', ?, ?)
+     ON CONFLICT(issue_id) DO UPDATE SET
+       state = 'executing',
+       last_plan = excluded.last_plan,
+       parent_issue_id = excluded.parent_issue_id,
+       updated_at = unixepoch()`,
+  ).run(childIssueId, lastPlan, parentIssueId);
 }

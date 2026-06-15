@@ -2,7 +2,7 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 import type { NextFunction, Request, Response } from 'express';
 import { config } from './config.js';
 import { dispatchExecution } from './executor.js';
-import { getBotUserId } from './linear.js';
+import { getBotUserId, setIssueState } from './linear.js';
 import { scheduleOrchestrator } from './orchestrator.js';
 import { claimForExecution, logEvent } from './state.js';
 
@@ -95,6 +95,10 @@ async function routeEvent(event: LinearEvent, botId: string) {
       }
       console.log(`[approval] ${data.identifier}: dispatching execution`);
       logEvent(data.id, 'approval', data);
+      // Reflect approval in the Linear workflow state. For tickets that split,
+      // children take over the "real" In Progress / In Review transitions —
+      // the parent stays in In Progress as a rollup container.
+      void setIssueState(data.id, config.IN_PROGRESS_STATE_NAME);
       void dispatchExecution(data.id).catch((err) => {
         console.error(`[approval] dispatch failed for ${data.identifier}:`, err);
       });
