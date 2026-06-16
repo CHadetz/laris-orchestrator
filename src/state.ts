@@ -37,6 +37,7 @@ for (const col of [
   'parent_issue_id TEXT',
   'identifier TEXT',
   'title TEXT',
+  'base_branch TEXT',
 ]) {
   try {
     db.exec(`ALTER TABLE tickets ADD COLUMN ${col}`);
@@ -63,6 +64,9 @@ export interface TicketRow {
   parent_issue_id: string | null;
   identifier: string | null;
   title: string | null;
+  /** Per-ticket base branch override. Used by B2 child tickets so their PRs
+   *  target the parent's feature branch instead of the configured BASE_BRANCH. */
+  base_branch: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -224,14 +228,24 @@ export function createChildTicket(
   childIssueId: string,
   parentIssueId: string,
   lastPlan: string,
+  baseBranch: string,
 ): void {
   db.prepare(
-    `INSERT INTO tickets (issue_id, state, last_plan, parent_issue_id)
-     VALUES (?, 'executing', ?, ?)
+    `INSERT INTO tickets (issue_id, state, last_plan, parent_issue_id, base_branch)
+     VALUES (?, 'executing', ?, ?, ?)
      ON CONFLICT(issue_id) DO UPDATE SET
        state = 'executing',
        last_plan = excluded.last_plan,
        parent_issue_id = excluded.parent_issue_id,
+       base_branch = excluded.base_branch,
        updated_at = unixepoch()`,
-  ).run(childIssueId, lastPlan, parentIssueId);
+  ).run(childIssueId, lastPlan, parentIssueId, baseBranch);
+}
+
+/** Persist the parent's chosen feature branch so the rollup comment can mention it. */
+export function setBaseBranch(issueId: string, baseBranch: string): void {
+  db.prepare(`
+    UPDATE tickets SET base_branch = ?, updated_at = unixepoch()
+    WHERE issue_id = ?
+  `).run(baseBranch, issueId);
 }

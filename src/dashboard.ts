@@ -1,9 +1,8 @@
-import { config } from './config.js';
+import { type ActivityEntry, listActivities } from './activity.js';
 import {
   listAllTickets,
   listRecentEvents,
   type EventRow,
-  type TicketRow,
 } from './state.js';
 
 interface TicketView {
@@ -20,6 +19,8 @@ interface TicketView {
   has_plan: boolean;
   created_at: number;
   updated_at: number;
+  /** Worker actively running for this ticket right now, if any. */
+  activity: { kind: string; started_at: number; detail?: string } | null;
 }
 
 interface EventView {
@@ -37,7 +38,6 @@ export interface DashboardState {
     total: number;
     by_state: Record<string, number>;
     total_cost_usd: number;
-    cap_usd: number | null;
   };
   tickets: TicketView[];
   events: EventView[];
@@ -46,26 +46,32 @@ export interface DashboardState {
 export function buildDashboardState(): DashboardState {
   const tickets = listAllTickets();
   const events = listRecentEvents(100);
+  const activitiesByIssue = new Map<string, ActivityEntry>();
+  for (const a of listActivities()) activitiesByIssue.set(a.issueId, a);
   const identifierByIssue = new Map<string, string | null>();
   for (const t of tickets) {
     identifierByIssue.set(t.issue_id, t.identifier);
   }
 
-  const ticketViews: TicketView[] = tickets.map((t) => ({
-    issue_id: t.issue_id,
-    identifier: t.identifier,
-    title: t.title,
-    state: t.state,
-    pr_url: t.pr_url,
-    pr_repo: t.pr_repo,
-    pr_number: t.pr_number,
-    total_cost_usd: t.total_cost_usd ?? 0,
-    parent_issue_id: t.parent_issue_id,
-    has_session: !!t.executor_session_id,
-    has_plan: !!t.last_plan,
-    created_at: t.created_at,
-    updated_at: t.updated_at,
-  }));
+  const ticketViews: TicketView[] = tickets.map((t) => {
+    const a = activitiesByIssue.get(t.issue_id);
+    return {
+      issue_id: t.issue_id,
+      identifier: t.identifier,
+      title: t.title,
+      state: t.state,
+      pr_url: t.pr_url,
+      pr_repo: t.pr_repo,
+      pr_number: t.pr_number,
+      total_cost_usd: t.total_cost_usd ?? 0,
+      parent_issue_id: t.parent_issue_id,
+      has_session: !!t.executor_session_id,
+      has_plan: !!t.last_plan,
+      created_at: t.created_at,
+      updated_at: t.updated_at,
+      activity: a ? { kind: a.kind, started_at: a.startedAt, detail: a.detail } : null,
+    };
+  });
 
   const eventViews: EventView[] = events.map((e: EventRow) => {
     let payload: unknown = e.payload;
@@ -101,7 +107,6 @@ export function buildDashboardState(): DashboardState {
       total_cost_usd: tickets
         .filter((t) => !t.parent_issue_id)
         .reduce((acc, t) => acc + (t.total_cost_usd ?? 0), 0),
-      cap_usd: config.MAX_COST_USD_PER_TICKET || null,
     },
     tickets: ticketViews,
     events: eventViews,
@@ -194,6 +199,25 @@ export const DASHBOARD_HTML = String.raw`<!doctype html>
   .empty { padding: 20px 14px; color: var(--muted); text-align: center; font-style: italic; }
   .updated-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--green); margin-right: 6px; vertical-align: middle; opacity: 0; transition: opacity 0.6s; }
   .updated-dot.on { opacity: 1; }
+  /* Live activity indicator on a ticket row */
+  .live-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--yellow); box-shadow: 0 0 0 0 color-mix(in srgb, var(--yellow) 60%, transparent); animation: pulse 1.4s ease-out infinite; margin-right: 2px; vertical-align: middle; }
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0   color-mix(in srgb, var(--yellow) 60%, transparent); }
+    70%  { box-shadow: 0 0 0 8px color-mix(in srgb, var(--yellow) 0%,  transparent); }
+    100% { box-shadow: 0 0 0 0   color-mix(in srgb, var(--yellow) 0%,  transparent); }
+  }
+  .pill.activity { color: var(--yellow); border-color: color-mix(in srgb, var(--yellow) 30%, transparent); background: color-mix(in srgb, var(--yellow) 12%, transparent); font-variant-numeric: tabular-nums; }
+  .ticket.active { background: color-mix(in srgb, var(--yellow) 5%, transparent); }
+  .retry { margin-left: auto; display: flex; gap: 6px; }
+  .retry button {
+    font: inherit; font-size: 11px; line-height: 1.4;
+    padding: 2px 8px; border-radius: 999px;
+    border: 1px solid var(--border); background: var(--panel-2); color: var(--muted);
+    cursor: pointer; transition: color .15s, border-color .15s, background .15s;
+  }
+  .retry button:hover { color: var(--text); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  .retry button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .retry button.spinning { color: var(--yellow); border-color: var(--yellow); }
 </style>
 </head>
 <body>
@@ -240,18 +264,31 @@ function fmtRelative(ts) {
   if (d < 86400) return Math.floor(d / 3600) + 'h ago';
   return Math.floor(d / 86400) + 'd ago';
 }
+function fmtElapsed(ts) {
+  const now = Math.floor(Date.now() / 1000);
+  const d = Math.max(0, now - ts);
+  if (d < 60) return d + 's';
+  const m = Math.floor(d / 60);
+  if (m < 60) return m + 'm ' + (d % 60) + 's';
+  const h = Math.floor(m / 60);
+  return h + 'h ' + (m % 60) + 'm';
+}
 function htmlEscape(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-function renderStats(s) {
+function renderStats(s, activeCount) {
   const states = Object.keys(s.by_state).sort();
   const stateChips = states
     .map((st) => '<span class="pill ' + st + '">' + st + ' ' + s.by_state[st] + '</span>')
     .join(' ');
+  const activeBlock = activeCount > 0
+    ? '<div class="stat"><div class="label">Active workers</div><div class="value" style="color:var(--yellow);"><span class="live-dot"></span> ' + activeCount + '</div></div>'
+    : '';
   $('stats').innerHTML =
     '<div class="stat"><div class="label">Tickets</div><div class="value">' + s.total + '</div></div>' +
-    '<div class="stat"><div class="label">Total cost</div><div class="value cost">' + fmtCost(s.total_cost_usd) + (s.cap_usd ? ' <span style="font-size:11px;color:var(--muted);">/ ' + fmtCost(s.cap_usd) + ' cap</span>' : '') + '</div></div>' +
+    activeBlock +
+    '<div class="stat"><div class="label">Total cost</div><div class="value cost">' + fmtCost(s.total_cost_usd) + '</div></div>' +
     '<div class="stat" style="flex:1;"><div class="label">By state</div><div class="value" style="font-size:14px;">' + (stateChips || '<span style="color:var(--muted);">—</span>') + '</div></div>';
 }
 
@@ -281,12 +318,28 @@ function renderTickets(tickets) {
       ? '<a href="' + htmlEscape(t.pr_url) + '" target="_blank" rel="noopener">' + htmlEscape(t.pr_repo + '#' + t.pr_number) + '</a>'
       : '';
     const ident = t.identifier ? htmlEscape(t.identifier) : '<span style="color:var(--muted);">' + htmlEscape(t.issue_id.slice(0, 8)) + '</span>';
-    return '<div class="ticket' + (isChild ? ' child' : '') + '">' +
+    const active = !!t.activity;
+    const activityPill = active
+      ? '<span class="pill activity" title="' + htmlEscape(t.activity.detail || '') + '"><span class="live-dot"></span>' + htmlEscape(t.activity.kind) + ' (' + fmtElapsed(t.activity.started_at) + ')</span>'
+      : '';
+    // Retrigger buttons: only when nothing is running and the action makes sense.
+    // - Re-plan: always available (planner is idempotent on the plan comment).
+    // - Re-execute: only if a plan exists and the ticket isn't a 'split' parent.
+    const retryButtons = active ? '' :
+      '<div class="retry">' +
+        '<button data-act="plan" data-id="' + htmlEscape(t.issue_id) + '" title="Re-run the planner against this ticket">↻ plan</button>' +
+        (t.has_plan && t.state !== 'split'
+          ? '<button data-act="execute" data-id="' + htmlEscape(t.issue_id) + '" title="Re-dispatch the executor (cleans up any leftover worktree first)">↻ execute</button>'
+          : '') +
+      '</div>';
+    return '<div class="ticket' + (isChild ? ' child' : '') + (active ? ' active' : '') + '">' +
       '<div class="main">' +
         '<div class="row">' +
           '<span class="id">' + ident + '</span>' +
           '<span class="title">' + htmlEscape(t.title || '(no title cached)') + '</span>' +
           '<span class="pill ' + t.state + '">' + t.state + '</span>' +
+          activityPill +
+          retryButtons +
         '</div>' +
         '<div class="meta">' +
           '<span>updated ' + fmtRelative(t.updated_at) + '</span>' +
@@ -324,13 +377,45 @@ function renderEvents(events) {
   }).join('');
 }
 
+// Delegate clicks on retry buttons. Re-render replaces the DOM every poll, so
+// listening on the container survives that.
+document.getElementById('tickets').addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('button[data-act]');
+  if (!btn) return;
+  const act = btn.getAttribute('data-act');
+  const id = btn.getAttribute('data-id');
+  btn.disabled = true;
+  btn.classList.add('spinning');
+  const original = btn.textContent;
+  btn.textContent = '…';
+  try {
+    const r = await fetch('/api/retry/' + encodeURIComponent(id) + '?kind=' + encodeURIComponent(act), { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      btn.textContent = original;
+      btn.classList.remove('spinning');
+      btn.disabled = false;
+      alert('Retry failed: ' + (j.error || ('HTTP ' + r.status)));
+      return;
+    }
+    // Force an immediate poll so the new activity shows up.
+    poll();
+  } catch (err) {
+    btn.textContent = original;
+    btn.classList.remove('spinning');
+    btn.disabled = false;
+    alert('Retry failed: ' + err.message);
+  }
+});
+
 let lastGeneratedAt = 0;
 async function poll() {
   try {
     const r = await fetch('/api/state', { cache: 'no-store' });
     if (!r.ok) throw new Error('http ' + r.status);
     const s = await r.json();
-    renderStats(s.stats);
+    const activeCount = s.tickets.filter((t) => t.activity).length;
+    renderStats(s.stats, activeCount);
     renderTickets(s.tickets);
     renderEvents(s.events);
     status.textContent = 'updated ' + new Date().toLocaleTimeString();

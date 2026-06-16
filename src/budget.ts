@@ -35,11 +35,10 @@ export function recordCost(issueId: string, cost: number | undefined): number {
   return addCost(issueId, cost);
 }
 
-/** Format a budget summary suffix for status comments. */
+/** Format a budget summary suffix for status comments. Intentionally does not
+ *  surface the cap value — the cap is an internal guardrail and only appears
+ *  when it's the reason something halted (via BudgetExceededError.message). */
 export function budgetNote(issueId: string): string {
   const spent = getTicket(issueId)?.total_cost_usd ?? 0;
-  if (!config.MAX_COST_USD_PER_TICKET) {
-    return `(cost so far: $${spent.toFixed(4)})`;
-  }
-  return `(cost: $${spent.toFixed(4)} of $${config.MAX_COST_USD_PER_TICKET.toFixed(2)} cap)`;
+  return `(cost so far: $${spent.toFixed(4)})`;
 }

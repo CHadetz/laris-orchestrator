@@ -1,12 +1,13 @@
 import { spawn } from 'node:child_process';
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
+import { withActivity } from './activity.js';
 import { assertBudget, BudgetExceededError, budgetNote, recordCost } from './budget.js';
 import { config } from './config.js';
 import { pathExists, runGit } from './git.js';
 import { createChildIssue, fetchIssueContext, type IssueContext, postComment, setIssueState } from './linear.js';
 import { extractSubtasks, type ParsedSubtask } from './orchestrator.js';
-import { createChildTicket, getTicket, listChildren, savePrInfo, setExecutorSessionId, type TicketRow, upsertTicket } from './state.js';
+import { createChildTicket, getTicket, listChildren, savePrInfo, setBaseBranch, setExecutorSessionId, type TicketRow, upsertTicket } from './state.js';
 
 const VERIFICATION_FIX_SYSTEM_PROMPT = `You opened a PR for a Linear ticket, but the project's verification command failed afterward. Your job is to make the smallest changes needed to make verification pass — do NOT change the scope of the original work.
 
@@ -100,7 +101,7 @@ export function dispatchExecution(issueId: string): Promise<void> {
   const prior = inFlight.get(issueId) ?? Promise.resolve();
   const next = prior
     .catch(() => undefined)
-    .then(() => runExecution(issueId))
+    .then(() => withActivity(issueId, 'executor', () => runExecution(issueId)))
     .finally(() => {
       if (inFlight.get(issueId) === next) {
         inFlight.delete(issueId);
@@ -142,14 +143,21 @@ async function runExecution(issueId: string): Promise<void> {
 
   const branch = branchFor(ctx.identifier);
   const worktreePath = path.join(config.WORKTREE_ROOT, ctx.identifier);
+  const baseBranch = ticket.base_branch ?? config.BASE_BRANCH;
 
-  console.log(`[executor] ${ctx.identifier}: preparing worktree at ${worktreePath}`);
+  console.log(`[executor] ${ctx.identifier}: preparing worktree at ${worktreePath} (base=${baseBranch})`);
   try {
-    await prepareWorktree(branch, worktreePath);
+    await prepareWorktree(branch, worktreePath, baseBranch);
   } catch (err) {
     await fail(issueId, ctx.identifier, `worktree setup failed: ${(err as Error).message}`, worktreePath);
     return;
   }
+
+  // Tell the subagent which base branch to target. For B2 children this is the
+  // parent's feature branch so all sibling PRs land in one testable place.
+  const baseNote = baseBranch === config.BASE_BRANCH
+    ? ''
+    : `\n\nThis work targets base branch \`${baseBranch}\` (not \`${config.BASE_BRANCH}\`). Open the PR with \`gh pr create --base ${baseBranch}\` so it lands on the right branch.`;
 
   const userPrompt = `# Ticket ${ctx.identifier}: ${ctx.title}
 
@@ -157,7 +165,7 @@ async function runExecution(issueId: string): Promise<void> {
 ${ticket.last_plan}
 
 ## Ticket description (for reference)
-${ctx.description || '(none)'}
+${ctx.description || '(none)'}${baseNote}
 
 Execute the plan. End with PR_URL: <url> or BLOCKED: <reason> on the final line.`;
 
@@ -305,7 +313,11 @@ Execute the plan. End with PR_URL: <url> or BLOCKED: <reason> on the final line.
   );
 }
 
-async function prepareWorktree(branch: string, worktreePath: string): Promise<void> {
+async function prepareWorktree(
+  branch: string,
+  worktreePath: string,
+  baseBranch: string,
+): Promise<void> {
   await mkdir(config.WORKTREE_ROOT, { recursive: true });
   if (await pathExists(worktreePath)) {
     throw new Error(
@@ -313,7 +325,7 @@ async function prepareWorktree(branch: string, worktreePath: string): Promise<vo
     );
   }
   await runGit(['fetch', '--prune', 'origin']);
-  await runGit(['worktree', 'add', worktreePath, '-b', branch, `origin/${config.BASE_BRANCH}`]);
+  await runGit(['worktree', 'add', worktreePath, '-b', branch, `origin/${baseBranch}`]);
 }
 
 async function cleanupWorktree(worktreePath: string, branch: string): Promise<void> {
@@ -629,7 +641,7 @@ export function dispatchFollowup(issueId: string, source: FollowupSource): Promi
   const prior = inFlight.get(issueId) ?? Promise.resolve();
   const next = prior
     .catch(() => undefined)
-    .then(() => runFollowup(issueId, source))
+    .then(() => withActivity(issueId, 'followup', () => runFollowup(issueId, source), describeSource(source)))
     .finally(() => {
       if (inFlight.get(issueId) === next) {
         inFlight.delete(issueId);
@@ -1004,10 +1016,17 @@ async function rollupParentIfComplete(childIssueId: string): Promise<void> {
       ? `All ${siblings.length} subtasks finished successfully.`
       : `${succeeded}/${siblings.length} subtasks succeeded, ${failed} failed.`;
 
+  // If this split used a feature branch, point the reviewer at the integrated
+  // result they can test in one place.
+  const featureBranch = parent.base_branch;
+  const featureNote = featureBranch
+    ? `\n\nAll child PRs target feature branch \`${featureBranch}\`. Once they're merged you can review the integrated result there, then open a PR \`${featureBranch}\` → \`${config.BASE_BRANCH}\`.`
+    : '';
+
   try {
     await postComment(
       child.parent_issue_id,
-      `${summary}\n\n${lines.join('\n')}\n\n${budgetNote(child.parent_issue_id)}`,
+      `${summary}\n\n${lines.join('\n')}${featureNote}\n\n${budgetNote(child.parent_issue_id)}`,
     );
   } catch (err) {
     console.error(`[rollup] failed to post rollup comment on parent ${child.parent_issue_id}:`, err);
@@ -1021,6 +1040,22 @@ async function splitIntoSubtasks(
 ): Promise<void> {
   if (!parentCtx.teamId) {
     await fail(parentIssueId, parentCtx.identifier, 'cannot split into subtasks: Linear team id not found on parent ticket');
+    return;
+  }
+
+  // Create a single feature branch off BASE_BRANCH that all sibling PRs will
+  // target. Reviewing children's PRs merges them here; the feature branch
+  // becomes the single testable, reviewable state for the whole ticket.
+  const featureBranch = branchFor(parentCtx.identifier);
+  try {
+    await ensureFeatureBranchOnRemote(featureBranch);
+    setBaseBranch(parentIssueId, featureBranch);
+  } catch (err) {
+    await fail(
+      parentIssueId,
+      parentCtx.identifier,
+      `could not create feature branch \`${featureBranch}\` on origin: ${(err as Error).message}`,
+    );
     return;
   }
 
@@ -1043,7 +1078,7 @@ async function splitIntoSubtasks(
       const planBody = sub.model
         ? `${sub.body}\n\n**Recommended execution model:** ${sub.model}`
         : sub.body;
-      createChildTicket(child.id, parentIssueId, planBody);
+      createChildTicket(child.id, parentIssueId, planBody, featureBranch);
       created.push({ id: child.id, identifier: child.identifier, title: sub.title });
       // Children skip approval, so flip them straight to In Progress.
       void setIssueState(child.id, config.IN_PROGRESS_STATE_NAME);
@@ -1069,13 +1104,37 @@ async function splitIntoSubtasks(
     : '';
   await postComment(
     parentIssueId,
-    `Split into ${created.length} subtask${created.length === 1 ? '' : 's'}:\n${childList}${failTail}\n\nEach child executes independently — no further approval needed.\n\n${budgetNote(parentIssueId)}`,
+    `Split into ${created.length} subtask${created.length === 1 ? '' : 's'}, all targeting feature branch \`${featureBranch}\` (off \`${config.BASE_BRANCH}\`):\n${childList}${failTail}\n\nEach child executes independently — no further approval needed. Children's PRs land on the feature branch so you can review and test them together; merge the feature branch to \`${config.BASE_BRANCH}\` when satisfied.\n\n${budgetNote(parentIssueId)}`,
   );
 
   for (const child of created) {
     void dispatchExecution(child.id).catch((err) => {
       console.error(`[split] ${parentCtx.identifier} → ${child.identifier}: dispatch failed:`, err);
     });
+  }
+}
+
+/** Create the feature branch on origin if it doesn't already exist. Idempotent. */
+async function ensureFeatureBranchOnRemote(featureBranch: string): Promise<void> {
+  await runGit(['fetch', '--prune', 'origin']);
+  try {
+    // Push origin/<base> to a new remote branch. Fails if the branch already
+    // exists, which we treat as "fine, reuse it" (could be a re-split or a
+    // human-initiated branch with the same name).
+    await runGit([
+      'push',
+      'origin',
+      `refs/remotes/origin/${config.BASE_BRANCH}:refs/heads/${featureBranch}`,
+    ]);
+    console.log(`[split] created feature branch ${featureBranch} on origin off ${config.BASE_BRANCH}`);
+  } catch (err) {
+    const msg = (err as Error).message;
+    // "already exists" / "non-fast-forward" — assume it's there and we'll reuse.
+    if (/already exists|non-fast-forward|rejected/i.test(msg)) {
+      console.log(`[split] feature branch ${featureBranch} already exists on origin, reusing`);
+      return;
+    }
+    throw err;
   }
 }
 

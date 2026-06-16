@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
+import { withActivity } from './activity.js';
 import { assertBudget, BudgetExceededError, budgetNote, recordCost } from './budget.js';
 import { config } from './config.js';
 import { pathExists, runGit } from './git.js';
@@ -91,7 +92,7 @@ export function scheduleOrchestrator(issueId: string, replyContext?: ReplyContex
   const prior = inFlight.get(issueId) ?? Promise.resolve();
   const next = prior
     .catch(() => undefined)
-    .then(() => runOrchestrator(issueId, replyContext))
+    .then(() => withActivity(issueId, 'planner', () => runOrchestrator(issueId, replyContext)))
     .finally(() => {
       if (inFlight.get(issueId) === next) {
         inFlight.delete(issueId);
