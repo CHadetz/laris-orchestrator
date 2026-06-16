@@ -35,6 +35,8 @@ for (const col of [
   'plan_comment_id TEXT',
   'total_cost_usd REAL NOT NULL DEFAULT 0',
   'parent_issue_id TEXT',
+  'identifier TEXT',
+  'title TEXT',
 ]) {
   try {
     db.exec(`ALTER TABLE tickets ADD COLUMN ${col}`);
@@ -59,6 +61,8 @@ export interface TicketRow {
   plan_comment_id: string | null;
   total_cost_usd: number;
   parent_issue_id: string | null;
+  identifier: string | null;
+  title: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -179,6 +183,40 @@ export function setExecutorSessionId(issueId: string, sessionId: string): void {
 /** List tickets stuck in 'executing' — used by startup reconciliation. */
 export function listExecutingTickets(): TicketRow[] {
   return db.prepare("SELECT * FROM tickets WHERE state = 'executing'").all() as TicketRow[];
+}
+
+/** Cache Linear identifier + title on the ticket row so the dashboard can render
+ *  without round-tripping Linear. Called from fetchIssueContext side-effect. */
+export function cacheTicketMeta(issueId: string, identifier: string, title: string): void {
+  db.prepare(`
+    INSERT INTO tickets (issue_id, state, identifier, title)
+    VALUES (?, 'planning', ?, ?)
+    ON CONFLICT(issue_id) DO UPDATE SET
+      identifier = excluded.identifier,
+      title = excluded.title
+  `).run(issueId, identifier, title);
+}
+
+/** All tickets, newest-updated first. Used by the dashboard. */
+export function listAllTickets(): TicketRow[] {
+  return db
+    .prepare('SELECT * FROM tickets ORDER BY updated_at DESC')
+    .all() as TicketRow[];
+}
+
+export interface EventRow {
+  id: number;
+  issue_id: string;
+  type: string;
+  payload: string;
+  created_at: number;
+}
+
+/** Recent events across all tickets. */
+export function listRecentEvents(limit = 100): EventRow[] {
+  return db
+    .prepare('SELECT * FROM events ORDER BY id DESC LIMIT ?')
+    .all(limit) as EventRow[];
 }
 
 /** Create a child ticket row (for B2 subtask splitting) with last_plan pre-populated. */

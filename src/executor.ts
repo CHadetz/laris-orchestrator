@@ -6,7 +6,7 @@ import { config } from './config.js';
 import { pathExists, runGit } from './git.js';
 import { createChildIssue, fetchIssueContext, type IssueContext, postComment, setIssueState } from './linear.js';
 import { extractSubtasks, type ParsedSubtask } from './orchestrator.js';
-import { createChildTicket, getTicket, listChildren, savePrInfo, setExecutorSessionId, upsertTicket } from './state.js';
+import { createChildTicket, getTicket, listChildren, savePrInfo, setExecutorSessionId, type TicketRow, upsertTicket } from './state.js';
 
 const VERIFICATION_FIX_SYSTEM_PROMPT = `You opened a PR for a Linear ticket, but the project's verification command failed afterward. Your job is to make the smallest changes needed to make verification pass — do NOT change the scope of the original work.
 
@@ -31,15 +31,18 @@ Output protocol — your FINAL line must be one of:
 
 The orchestrator will re-run verification after you push. If it passes, you're done. If it still fails and retries remain, you'll be invoked again with the new output.`;
 
-const FOLLOWUP_SUBAGENT_SYSTEM_PROMPT = `You are continuing work on a PR that has already been opened for a Linear ticket. A reviewer has commented on the PR and you need to respond.
+const FOLLOWUP_SUBAGENT_SYSTEM_PROMPT = `You are continuing work on a PR that has already been opened for a Linear ticket. Something happened on the PR that needs your response: a comment, a review, a line-anchored review comment, or a failed CI check. Your user prompt names which.
 
-Your cwd is a freshly checked-out worktree on the same branch as the PR — your previous commits are already there. The session has been resumed, so you remember the original plan.
+Your cwd is a freshly checked-out worktree on the same branch as the PR — your previous commits are already there. The session has been resumed if available, so you may remember the original plan; if not, the plan is in your prompt.
 
 Do this:
 1. Re-read CLAUDE.md and README.md in case anything has changed.
-2. Read the reviewer's comment carefully. Decide: does it require code changes, or is it a question/discussion?
+2. Read the input carefully. Decide: does it require code changes, or is it a question/discussion?
+   - For PR comments and review summaries: judge intent and respond.
+   - For line-anchored review comments: read the file and the surrounding code, not just the diff hunk in the prompt.
+   - For CI failures: investigate the failure. If the output in the prompt isn't enough, run \`gh run view --log-failed\` against the details URL. Make the smallest possible fix.
 3. If code changes are needed: implement them, run lint/format/typecheck/tests, commit, then push. Your HEAD is detached (so the user can have the same branch checked out elsewhere) — push with the explicit refspec in your user prompt. The existing PR will auto-update.
-4. Do NOT post a comment on the PR yourself. The orchestrator will post your reply for you, using the text after the protocol marker on your final line (see below). Just make that reply text good.
+4. Do NOT post a comment on the PR yourself. The orchestrator will post your reply for you, using the text after the protocol marker on your final line (see below). For line-anchored comments your reply will be threaded under the original comment. Just make that reply text good.
 
 The reply text the orchestrator posts:
 - Directly addresses the reviewer's specific point — this is a real conversation.
@@ -602,15 +605,31 @@ function extractRecommendedModel(plan: string): string | undefined {
   return m?.[1];
 }
 
-export function dispatchFollowup(
-  issueId: string,
-  commenter: string,
-  commentBody: string,
-): Promise<void> {
+export type FollowupSource =
+  | { kind: 'pr_comment'; commenter: string; body: string }
+  | {
+      kind: 'review_comment';
+      commenter: string;
+      body: string;
+      filePath: string;
+      line?: number;
+      diffHunk?: string;
+      commentId: number;
+    }
+  | { kind: 'review'; commenter: string; body: string; state: string }
+  | {
+      kind: 'ci_failure';
+      checkName: string;
+      conclusion: string;
+      output: string;
+      detailsUrl?: string;
+    };
+
+export function dispatchFollowup(issueId: string, source: FollowupSource): Promise<void> {
   const prior = inFlight.get(issueId) ?? Promise.resolve();
   const next = prior
     .catch(() => undefined)
-    .then(() => runFollowup(issueId, commenter, commentBody))
+    .then(() => runFollowup(issueId, source))
     .finally(() => {
       if (inFlight.get(issueId) === next) {
         inFlight.delete(issueId);
@@ -620,15 +639,108 @@ export function dispatchFollowup(
   return next;
 }
 
-async function runFollowup(issueId: string, commenter: string, commentBody: string): Promise<void> {
+function describeSource(source: FollowupSource): string {
+  switch (source.kind) {
+    case 'pr_comment':
+      return `PR comment from @${source.commenter}`;
+    case 'review_comment':
+      return `line-anchored review comment from @${source.commenter} on ${source.filePath}${source.line ? `:${source.line}` : ''}`;
+    case 'review':
+      return `PR review (${source.state}) from @${source.commenter}`;
+    case 'ci_failure':
+      return `CI check failed: ${source.checkName}`;
+  }
+}
+
+function buildFollowupPrompt(
+  source: FollowupSource,
+  ticket: TicketRow,
+  ctx: IssueContext,
+  branch: string,
+  haveSession: boolean,
+): string {
+  const planContext = ticket.last_plan
+    ? `## Original approved plan\n${ticket.last_plan}\n\n## Ticket description\n${ctx.description || '(none)'}\n\n---\n\n`
+    : '';
+  const sessionHint = haveSession
+    ? ''
+    : `_(No prior session is being resumed for this PR — start fresh. Read the diff with \`git diff origin/${config.BASE_BRANCH}...HEAD\` to see what was already implemented.)_\n\n`;
+  const pushHint = `If you need to push commits, your HEAD is detached. Push with:
+\`\`\`
+git push origin HEAD:${branch}
+\`\`\``;
+
+  switch (source.kind) {
+    case 'pr_comment':
+      return `# PR comment from @${source.commenter} on ${ticket.pr_url}
+
+${planContext}${sessionHint}> ${source.body.replace(/\n/g, '\n> ')}
+
+Address this. The orchestrator will post your reply on the PR — do NOT post one yourself.
+
+${pushHint}
+
+End with UPDATED: <reply text>, NO_CHANGES: <reply text>, or BLOCKED: <reason> on the final line.`;
+
+    case 'review_comment': {
+      const loc = source.line ? `${source.filePath}:${source.line}` : source.filePath;
+      const hunk = source.diffHunk
+        ? `\n\nDiff hunk the comment refers to:\n\`\`\`diff\n${source.diffHunk}\n\`\`\`\n`
+        : '\n';
+      return `# Line-anchored review comment on PR ${ticket.pr_url}
+
+${planContext}${sessionHint}From @${source.commenter} on \`${loc}\`:${hunk}
+> ${source.body.replace(/\n/g, '\n> ')}
+
+Address this. The orchestrator will thread your reply UNDER the line comment — do NOT post one yourself.
+
+${pushHint}
+
+End with UPDATED: <reply text>, NO_CHANGES: <reply text>, or BLOCKED: <reason> on the final line.`;
+    }
+
+    case 'review':
+      return `# Pull request review from @${source.commenter} (state: ${source.state}) on ${ticket.pr_url}
+
+${planContext}${sessionHint}Review body:
+
+> ${source.body.replace(/\n/g, '\n> ')}
+
+This is the overall review summary. Any line-anchored comments arrive as separate events you may already have handled or will handle next.
+
+Address this. The orchestrator will post your reply on the PR — do NOT post one yourself.
+
+${pushHint}
+
+End with UPDATED: <reply text>, NO_CHANGES: <reply text>, or BLOCKED: <reason> on the final line.`;
+
+    case 'ci_failure': {
+      const tail = source.output.slice(-4000);
+      const detailsLine = source.detailsUrl ? `\nDetails: ${source.detailsUrl}` : '';
+      return `# CI check failed on PR ${ticket.pr_url}
+
+${planContext}${sessionHint}Check: \`${source.checkName}\` (conclusion: ${source.conclusion})${detailsLine}
+
+Last ~4KB of check output:
+\`\`\`
+${tail}
+\`\`\`
+
+Investigate. If the check output is not enough, run \`gh run view --log-failed\` (or follow the details URL) to see full logs. Fix the failure with the minimum change needed — do NOT widen scope. Then commit and push.
+
+${pushHint}
+
+End with UPDATED: <reply text>, NO_CHANGES: <reply text>, or BLOCKED: <reason> on the final line. The reply text will be posted on the PR.`;
+    }
+  }
+}
+
+async function runFollowup(issueId: string, source: FollowupSource): Promise<void> {
   const ticket = getTicket(issueId);
   if (!ticket?.pr_url) {
     console.warn(`[followup] ${issueId}: no PR info on file, skipping`);
     return;
   }
-  // executor_session_id may be missing (e.g. ticket recovered from a worker
-  // crash before mid-stream session persistence shipped). We can still respond
-  // — we'll pass the plan as context and start a fresh session.
   const haveSession = !!ticket.executor_session_id;
 
   const ctx = await fetchIssueContext(issueId);
@@ -637,58 +749,36 @@ async function runFollowup(issueId: string, commenter: string, commentBody: stri
 
   const prRepo = ticket.pr_repo!;
   const prNumber = ticket.pr_number!;
+  const sourceDesc = describeSource(source);
 
   try {
     assertBudget(issueId);
   } catch (err) {
     if (err instanceof BudgetExceededError) {
-      await tryPostPrComment(prRepo, prNumber, `Cannot respond: ${err.message}.`, ctx.identifier);
+      await replyToSource(source, prRepo, prNumber, `Cannot respond: ${err.message}.`, ctx.identifier);
       return;
     }
     throw err;
   }
 
-  console.log(`[followup] ${ctx.identifier}: rehydrating worktree for PR comment from ${commenter}`);
+  console.log(`[followup] ${ctx.identifier}: rehydrating worktree for ${sourceDesc}`);
   try {
     await prepareFollowupWorktree(branch, worktreePath);
   } catch (err) {
     console.error(`[followup] ${ctx.identifier}: worktree rehydration failed: ${(err as Error).message}`);
-    await tryPostPrComment(
+    await replyToSource(
+      source,
       prRepo,
       prNumber,
-      `Could not act on this comment: worktree rehydration failed (${(err as Error).message}).`,
+      `Could not act on this: worktree rehydration failed (${(err as Error).message}).`,
       ctx.identifier,
     );
     return;
   }
 
-  // Always include plan + description as context so this works with or without
-  // session resume. When the session is resumed, this is mostly redundant but
-  // cheap. When it isn't, this is what gives the subagent enough to act.
-  const planContext = ticket.last_plan
-    ? `## Original approved plan\n${ticket.last_plan}\n\n## Ticket description\n${ctx.description || '(none)'}\n\n---\n\n`
-    : '';
-  const sessionContext = haveSession
-    ? ''
-    : `_(No prior session is being resumed for this PR — the worker crashed and lost the handle. Treat the plan above as your full context. Read the diff with \`git diff origin/${config.BASE_BRANCH}...HEAD\` to see what was already implemented.)_\n\n`;
-
-  const prompt = `# Reviewer feedback on PR ${ticket.pr_url}
-
-${planContext}${sessionContext}From @${commenter}:
-
-> ${commentBody.replace(/\n/g, '\n> ')}
-
-Address this. The orchestrator will post your reply on the PR — do NOT post one yourself.
-
-If you need to push commits, your HEAD is detached. Push with:
-\`\`\`
-git push origin HEAD:${branch}
-\`\`\`
-
-End with UPDATED: <reply text>, NO_CHANGES: <reply text>, or BLOCKED: <reason> on the final line.`;
-
+  const prompt = buildFollowupPrompt(source, ticket, ctx, branch, haveSession);
   const model = ticket.last_plan ? extractRecommendedModel(ticket.last_plan) : undefined;
-  console.log(`[followup] ${ctx.identifier}: spawning subagent (session=${haveSession ? 'resumed' : 'fresh'}, model=${model ?? 'default'})`);
+  console.log(`[followup] ${ctx.identifier}: spawning subagent for ${sourceDesc} (session=${haveSession ? 'resumed' : 'fresh'}, model=${model ?? 'default'})`);
   let result: ClaudeResult;
   try {
     result = await runSubagent({
@@ -701,49 +791,39 @@ End with UPDATED: <reply text>, NO_CHANGES: <reply text>, or BLOCKED: <reason> o
     });
   } catch (err) {
     await cleanupWorktree(worktreePath, branch);
-    await tryPostPrComment(
-      prRepo,
-      prNumber,
-      `Follow-up subagent crashed: ${(err as Error).message}`,
-      ctx.identifier,
-    );
+    await replyToSource(source, prRepo, prNumber, `Subagent crashed: ${(err as Error).message}`, ctx.identifier);
     return;
   }
 
   if (result.is_error || !result.result) {
     await cleanupWorktree(worktreePath, branch);
-    await tryPostPrComment(
-      prRepo,
-      prNumber,
-      `Follow-up subagent returned error: ${JSON.stringify(result)}`,
-      ctx.identifier,
-    );
+    await replyToSource(source, prRepo, prNumber, `Subagent returned error: ${JSON.stringify(result)}`, ctx.identifier);
     return;
   }
 
-  // Persist the new session id so the conversation thread keeps growing across follow-ups.
   savePrInfo(issueId, ticket.pr_url, prRepo, prNumber, result.session_id);
   recordCost(issueId, result.total_cost_usd);
 
   const outcome = parseFollowupOutcome(result.result);
   await cleanupWorktree(worktreePath, branch);
 
-  const auditPrefix = `[audit] PR feedback from @${commenter} on ${ticket.pr_url} —`;
+  const auditPrefix = `[audit] ${sourceDesc} on ${ticket.pr_url} —`;
 
   if (outcome.kind === 'updated') {
-    const r = await tryPostPrComment(prRepo, prNumber, outcome.summary, ctx.identifier);
+    const r = await replyToSource(source, prRepo, prNumber, outcome.summary, ctx.identifier);
     await postComment(issueId, `${auditPrefix} pushed update: ${outcome.summary}${prPostNote(r)} ${budgetNote(issueId)}`);
     console.log(`[followup] ${ctx.identifier}: updated — ${outcome.summary}`);
   } else if (outcome.kind === 'no_changes') {
-    const r = await tryPostPrComment(prRepo, prNumber, outcome.reason, ctx.identifier);
+    const r = await replyToSource(source, prRepo, prNumber, outcome.reason, ctx.identifier);
     await postComment(issueId, `${auditPrefix} no code change: ${outcome.reason}${prPostNote(r)}`);
     console.log(`[followup] ${ctx.identifier}: no_changes — ${outcome.reason}`);
   } else if (outcome.kind === 'blocked') {
-    const r = await tryPostPrComment(prRepo, prNumber, `Blocked: ${outcome.reason}`, ctx.identifier);
+    const r = await replyToSource(source, prRepo, prNumber, `Blocked: ${outcome.reason}`, ctx.identifier);
     await postComment(issueId, `${auditPrefix} blocked: ${outcome.reason}${prPostNote(r)}`);
     console.log(`[followup] ${ctx.identifier}: blocked — ${outcome.reason}`);
   } else {
-    const r = await tryPostPrComment(
+    const r = await replyToSource(
+      source,
       prRepo,
       prNumber,
       `Subagent finished without an UPDATED/NO_CHANGES/BLOCKED marker — see Linear ticket for details.`,
@@ -754,6 +834,31 @@ End with UPDATED: <reply text>, NO_CHANGES: <reply text>, or BLOCKED: <reason> o
       `${auditPrefix} subagent finished without UPDATED/NO_CHANGES/BLOCKED marker.${prPostNote(r)} Last 500 chars:\n${result.result.slice(-500)}`,
     );
   }
+}
+
+/** Route the reply to the right place: thread it under a line comment, or post
+ *  top-level on the PR for everything else. */
+async function replyToSource(
+  source: FollowupSource,
+  repo: string,
+  prNumber: number,
+  body: string,
+  identifier: string,
+): Promise<PrPostResult> {
+  if (source.kind === 'review_comment') {
+    try {
+      await postPrReviewCommentReply(repo, prNumber, source.commentId, body);
+      console.log(`[followup] ${identifier}: posted threaded reply on PR ${repo}#${prNumber} (comment ${source.commentId})`);
+      return { ok: true };
+    } catch (err) {
+      const msg = (err as Error).message;
+      console.error(`[followup] ${identifier}: threaded reply failed, falling back to top-level: ${msg}`);
+      // Fall through to top-level post so the reply isn't lost.
+      const top = await tryPostPrComment(repo, prNumber, body, identifier);
+      return top.ok ? top : { ok: false, error: `threaded: ${msg}; top-level: ${top.error}` };
+    }
+  }
+  return tryPostPrComment(repo, prNumber, body, identifier);
 }
 
 interface PrPostResult {
@@ -804,6 +909,44 @@ function postPrComment(repo: string, number: number, body: string): Promise<void
     });
     child.on('error', reject);
     child.stdin.end(body);
+  });
+}
+
+/** Post a threaded reply to a PR line-anchored review comment, via the GitHub
+ *  REST API. Uses `gh api --input -` and pipes JSON through stdin so multi-line
+ *  bodies survive shell quoting. */
+function postPrReviewCommentReply(
+  repo: string,
+  prNumber: number,
+  commentId: number,
+  body: string,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      'gh',
+      [
+        'api',
+        '--method', 'POST',
+        `/repos/${repo}/pulls/${prNumber}/comments/${commentId}/replies`,
+        '--input', '-',
+      ],
+      {
+        env: {
+          ...process.env,
+          ...(config.GITHUB_TOKEN
+            ? { GITHUB_TOKEN: config.GITHUB_TOKEN, GH_TOKEN: config.GITHUB_TOKEN }
+            : {}),
+        },
+      },
+    );
+    let stderr = '';
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`gh api (review-comment reply) exited ${code}: ${stderr}`));
+    });
+    child.on('error', reject);
+    child.stdin.end(JSON.stringify({ body }));
   });
 }
 

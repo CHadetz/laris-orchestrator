@@ -1,5 +1,6 @@
 import { LinearClient } from '@linear/sdk';
 import { config } from './config.js';
+import { cacheTicketMeta } from './state.js';
 
 export const linear = new LinearClient({ apiKey: config.LINEAR_API_KEY });
 
@@ -33,6 +34,8 @@ export async function fetchIssueContext(issueId: string): Promise<IssueContext> 
     const user = await c.user;
     parts.push(`[${user?.name ?? 'unknown'} @ ${c.createdAt}]\n${c.body}`);
   }
+
+  cacheTicketMeta(issue.id, issue.identifier, issue.title);
 
   return {
     id: issue.id,

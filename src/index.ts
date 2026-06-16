@@ -1,5 +1,6 @@
 import express from 'express';
 import { config } from './config.js';
+import { buildDashboardState, DASHBOARD_HTML } from './dashboard.js';
 import { handleGithubWebhook, verifyGithubSignature } from './github-webhooks.js';
 import { getBotUserId } from './linear.js';
 import { reconcileOrphanedExecutors } from './recovery.js';
@@ -27,6 +28,14 @@ app.use('/webhooks/github', rawBodyJsonMiddleware);
 
 app.get('/health', (_req, res) => {
   res.send('ok');
+});
+
+// Dashboard — localhost-only by default. If you expose this via ngrok, add auth.
+app.get('/', (_req, res) => {
+  res.type('html').send(DASHBOARD_HTML);
+});
+app.get('/api/state', (_req, res) => {
+  res.json(buildDashboardState());
 });
 
 app.post('/webhooks/linear', verifyLinearSignature, handleWebhook);
