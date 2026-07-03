@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
-import { extractSubtasks, topoSort, type ParsedSubtask } from './subtasks.js';
+import { extractSubtasks, inlineSubtaskBlocks, topoSort, type ParsedSubtask } from './subtasks.js';
 
 // ---------- extractSubtasks ----------
 
@@ -130,6 +130,60 @@ body
     assert.equal(subs[0].title, 'Reorder');
     assert.equal(subs[0].model, 'haiku');
     assert.deepEqual(subs[0].depends, ['a', 'b']);
+  });
+});
+
+// ---------- inlineSubtaskBlocks ----------
+
+describe('inlineSubtaskBlocks', () => {
+  it('returns text unchanged when there are no blocks', () => {
+    const input = '# Plan\n\nJust prose.';
+    assert.equal(inlineSubtaskBlocks(input), input);
+  });
+
+  it('strips a single block\'s markers and preserves its body', () => {
+    const plan = `# Plan
+
+<!-- SUBTASK_START id="schema" title="Schema" -->
+## Schema
+Create the tables.
+<!-- SUBTASK_END -->
+
+After.`;
+    const out = inlineSubtaskBlocks(plan);
+    assert.match(out, /## Schema/);
+    assert.match(out, /Create the tables\./);
+    assert.doesNotMatch(out, /SUBTASK_START/);
+    assert.doesNotMatch(out, /SUBTASK_END/);
+  });
+
+  it('inlines multiple blocks in order', () => {
+    const plan = `<!-- SUBTASK_START id="a" title="A" -->
+Body A
+<!-- SUBTASK_END -->
+
+<!-- SUBTASK_START id="b" title="B" depends="a" -->
+Body B
+<!-- SUBTASK_END -->`;
+    const out = inlineSubtaskBlocks(plan);
+    assert.match(out, /Body A/);
+    assert.match(out, /Body B/);
+    assert.ok(out.indexOf('Body A') < out.indexOf('Body B'));
+    assert.doesNotMatch(out, /SUBTASK_/);
+  });
+
+  it('does not touch prose outside blocks', () => {
+    const plan = `Before block.
+
+<!-- SUBTASK_START id="x" title="X" -->
+Inside.
+<!-- SUBTASK_END -->
+
+After block.`;
+    const out = inlineSubtaskBlocks(plan);
+    assert.match(out, /Before block\./);
+    assert.match(out, /After block\./);
+    assert.match(out, /Inside\./);
   });
 });
 

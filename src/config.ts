@@ -29,6 +29,14 @@ const schema = z
     // with a warning.
     IN_PROGRESS_STATE_NAME: z.string().default('In Progress'),
     IN_REVIEW_STATE_NAME: z.string().default('In Review'),
+    // How to handle SUBTASK blocks emitted by the planner:
+    // - "off" (default): ignore them. One executor runs the whole plan and
+    //   produces one PR. Subtask block bodies are inlined into the plan the
+    //   subagent sees, so the planner's phase-by-phase structure survives.
+    // - "stacked": split into Linear sub-issues, each with its own executor
+    //   and stacked PR (dependents target their prereq's branch). Parallel
+    //   but produces N PRs to merge.
+    SPLIT_STRATEGY: z.enum(['off', 'stacked']).default('off'),
   })
   .transform((c) => ({
     ...c,

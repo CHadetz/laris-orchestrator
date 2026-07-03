@@ -18,6 +18,13 @@ export interface ParsedSubtask {
 const SUBTASK_BLOCK_RE =
   /<!--\s*SUBTASK_START\b([^>]*?)-->\s*\n?([\s\S]*?)\n?\s*<!--\s*SUBTASK_END\s*-->/gi;
 
+/** Remove SUBTASK_START/END markers but keep the body content in place.
+ *  Used when SPLIT_STRATEGY=off so a single subagent sees the planner's
+ *  per-subtask phase content as plain plan sections. */
+export function inlineSubtaskBlocks(text: string): string {
+  return text.replace(SUBTASK_BLOCK_RE, (_full, _attrs, body) => String(body).trim());
+}
+
 export function extractSubtasks(plan: string): ParsedSubtask[] {
   const out: ParsedSubtask[] = [];
   let synth = 0;

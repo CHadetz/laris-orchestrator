@@ -6,7 +6,7 @@ import { assertBudget, BudgetExceededError, budgetNote, recordCost } from './bud
 import { config } from './config.js';
 import { pathExists, runGit } from './git.js';
 import { createChildIssue, fetchIssueContext, type IssueContext, postComment, setIssueState } from './linear.js';
-import { extractSubtasks, type ParsedSubtask, topoSort } from './subtasks.js';
+import { extractSubtasks, inlineSubtaskBlocks, type ParsedSubtask, topoSort } from './subtasks.js';
 import { createChildTicket, getTicket, listChildren, readDependencyIds, savePrInfo, setBaseBranch, setChildExecuting, setExecutorSessionId, type TicketRow, upsertTicket } from './state.js';
 
 const VERIFICATION_FIX_SYSTEM_PROMPT = `Your initial work is committed in the worktree, but the project's verification command failed against it. Your job is to make the smallest changes needed to make verification pass — do NOT change the scope of the original work. Nothing has been pushed yet; the orchestrator gates the push on verification.
@@ -130,11 +130,13 @@ async function runExecution(issueId: string): Promise<void> {
 
   const ctx = await fetchIssueContext(issueId);
 
-  // B2: if the parent's plan contains SUBTASK blocks, materialize children and
-  // hand off execution to each. Children inherit a self-contained plan body
-  // and don't re-trigger splitting. Top-level only — child tickets have
-  // parent_issue_id set, so we don't recurse.
-  if (!ticket.parent_issue_id) {
+  // B2: if the parent's plan contains SUBTASK blocks AND split is enabled,
+  // materialize Linear children and hand off execution to each. When split is
+  // off (default), we ignore the blocks structurally and inline their bodies
+  // into the plan the single subagent sees (see the userPrompt below), so the
+  // planner's phase-by-phase structure survives as narrative.
+  // Top-level only — child tickets have parent_issue_id set, so we don't recurse.
+  if (!ticket.parent_issue_id && config.SPLIT_STRATEGY === 'stacked') {
     const subtasks = extractSubtasks(ticket.last_plan);
     if (subtasks.length > 0) {
       await splitIntoSubtasks(issueId, ctx, subtasks);
@@ -207,10 +209,16 @@ Resolve conflicts conservatively — prefer keeping both siblings' implementatio
     }
   }
 
+  // With split off, the planner's SUBTASK blocks (if any) are inlined so their
+  // body content appears as plain plan sections. With split on, top-level parent
+  // never gets here (splitIntoSubtasks returns above); children have last_plan
+  // populated with just their own subtask body (no blocks to inline).
+  const planForPrompt = inlineSubtaskBlocks(ticket.last_plan);
+
   const userPrompt = `# Ticket ${ctx.identifier}: ${ctx.title}
 
 ## Approved plan
-${ticket.last_plan}
+${planForPrompt}
 
 ## Ticket description (for reference)
 ${ctx.description || '(none)'}${baseNote}${mergeNote}
