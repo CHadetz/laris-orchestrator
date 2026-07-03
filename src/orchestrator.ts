@@ -43,7 +43,7 @@ SUBTASK BLOCKS (only used when output type is REVISE and you've decided to split
 
 For each subtask, embed a block ANYWHERE inside the REVISE plan body using this exact format (HTML comments — invisible in the rendered Linear comment, but parsed by the orchestrator):
 
-<!-- SUBTASK_START title="Short title for the Linear sub-issue" model="opus|sonnet|haiku" -->
+<!-- SUBTASK_START id="kebab-case-key" title="Short title for the Linear sub-issue" model="opus|sonnet|haiku" depends="other-id,another-id" -->
 The full body the child executor will see, in markdown.
 - Restate the goal of this subtask in 1–2 sentences.
 - List the files / modules / endpoints involved.
@@ -52,12 +52,31 @@ The full body the child executor will see, in markdown.
 End with: **Recommended execution model:** opus|sonnet|haiku
 <!-- SUBTASK_END -->
 
+Attributes:
+- \`id\` (recommended) — short kebab-case key local to this plan. Used only to cross-reference in \`depends=\`. If omitted, the orchestrator auto-synthesizes \`sub-N\` but that subtask cannot be depended on.
+- \`title\` (required) — becomes the Linear sub-issue title.
+- \`model\` (optional) — overrides the per-subtask \`Recommended execution model:\` line.
+- \`depends\` (optional) — comma-separated list of sibling \`id\`s this subtask must come after. Empty/absent = independent (runs in parallel with other independents).
+
 Rules:
 - The opening tag must be on its own line. Do not split it across lines.
 - The block body must be self-contained — the child gets ONLY this body as its plan, plus the ticket title/description.
-- The model="" attribute is optional; if you set it, it overrides the per-subtask "Recommended execution model:" line inside the body.
 - You can include any number of subtask blocks. If you include ZERO, the parent ticket executes the whole plan itself (no split happens).
 - Include the same number of subtask blocks as subtasks you describe in prose.
+
+SHARED FOUNDATIONS — the most important rule:
+
+When two or more subtasks would need the SAME piece of code (a hook, a DB schema/migration, a shared helper, a middleware, a base component), DO NOT instruct each subtask to build it. Each would invent an incompatible version and the PRs would collide on merge. Instead:
+- Define a separate "foundation" subtask whose entire scope is that shared piece.
+- Give every consumer a \`depends="<foundation-id>"\` attribute.
+- The orchestrator dispatches the foundation first, then branches each dependent off the foundation's branch so they actually see the foundation's code.
+
+Examples:
+- Pagination epic → one foundation subtask building the shared \`use-server-list\` hook, then per-resource subtasks (\`products\`, \`leads\`, \`deals\`, …) all with \`depends="hook"\`.
+- DB-backed feature → one schema/migration subtask, then a service subtask with \`depends="schema"\`, then a REST subtask with \`depends="service"\`, then a frontend subtask with \`depends="rest"\`.
+- Multiple deps on different siblings are allowed (\`depends="a,b"\`); the dependent's worktree branches off the FIRST listed dep and the subagent is instructed to \`git merge\` the others in.
+
+Cycles are an error; the orchestrator will refuse the split.
 
 On the FINAL line of your output, append EXACTLY one of these markers (HTML comments, invisible in Linear):
 
@@ -220,33 +239,8 @@ Based on the above, draft (or revise) your plan.`;
   }
 }
 
-export interface ParsedSubtask {
-  title: string;
-  body: string;
-  /** Optional model override from the opening tag's model="..." attribute. */
-  model?: string;
-}
-
-/** Public helper so the executor / approval flow can read the latest plan's subtasks. */
-export function extractSubtasks(plan: string): ParsedSubtask[] {
-  const re = /<!--\s*SUBTASK_START\b([^>]*?)-->\s*\n?([\s\S]*?)\n?\s*<!--\s*SUBTASK_END\s*-->/gi;
-  const out: ParsedSubtask[] = [];
-  for (const m of plan.matchAll(re)) {
-    const attrs = m[1] ?? '';
-    const titleMatch = /title\s*=\s*"([^"]+)"/i.exec(attrs);
-    const modelMatch = /model\s*=\s*"([^"]+)"/i.exec(attrs);
-    if (!titleMatch) {
-      console.warn('[orchestrator] subtask block missing title="..." attribute — skipping');
-      continue;
-    }
-    out.push({
-      title: titleMatch[1].trim(),
-      body: m[2].trim(),
-      ...(modelMatch ? { model: modelMatch[1].trim() } : {}),
-    });
-  }
-  return out;
-}
+// Re-exported from subtasks.ts so callers (executor.ts) can keep importing from here.
+export { extractSubtasks, type ParsedSubtask } from './subtasks.js';
 
 type Mode = 'revise' | 'reply';
 

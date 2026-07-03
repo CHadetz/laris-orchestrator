@@ -6,10 +6,10 @@ import { assertBudget, BudgetExceededError, budgetNote, recordCost } from './bud
 import { config } from './config.js';
 import { pathExists, runGit } from './git.js';
 import { createChildIssue, fetchIssueContext, type IssueContext, postComment, setIssueState } from './linear.js';
-import { extractSubtasks, type ParsedSubtask } from './orchestrator.js';
-import { createChildTicket, getTicket, listChildren, savePrInfo, setBaseBranch, setExecutorSessionId, type TicketRow, upsertTicket } from './state.js';
+import { extractSubtasks, type ParsedSubtask, topoSort } from './subtasks.js';
+import { createChildTicket, getTicket, listChildren, readDependencyIds, savePrInfo, setBaseBranch, setChildExecuting, setExecutorSessionId, type TicketRow, upsertTicket } from './state.js';
 
-const VERIFICATION_FIX_SYSTEM_PROMPT = `You opened a PR for a Linear ticket, but the project's verification command failed afterward. Your job is to make the smallest changes needed to make verification pass — do NOT change the scope of the original work.
+const VERIFICATION_FIX_SYSTEM_PROMPT = `Your initial work is committed in the worktree, but the project's verification command failed against it. Your job is to make the smallest changes needed to make verification pass — do NOT change the scope of the original work. Nothing has been pushed yet; the orchestrator gates the push on verification.
 
 Your cwd is the same worktree where you committed your initial implementation; your earlier commits are there. The session has been resumed, so you remember the original plan and what you've done.
 
@@ -17,20 +17,20 @@ Do this:
 1. Read the verification output in your user prompt to see what failed.
 2. If CLAUDE.md or README.md document the failing checks, re-read the relevant sections.
 3. Make the minimum fix. Do not refactor unrelated code.
-4. Commit with a clear message describing the fix, then \`git push origin HEAD\`. The PR will auto-update.
+4. Commit with a clear message describing the fix. **DO NOT push.** The orchestrator will re-run verification and push only when it passes.
 
 Hard rules:
+- Do NOT run \`git push\`.
 - Do NOT open a new PR.
 - Do NOT amend or force-push.
-- Do NOT push to or modify the base branch (${config.BASE_BRANCH}).
 - Do NOT skip hooks (--no-verify) or signing.
 - Do NOT silence failures with \`// @ts-ignore\`, \`// eslint-disable\`, \`# noqa\`, etc. unless absolutely necessary and explained in the commit message.
 
 Output protocol — your FINAL line must be one of:
-- \`FIXED: <one-line summary>\`  if you pushed a fix
+- \`FIXED: <one-line summary>\`  if you committed a fix
 - \`BLOCKED: <reason>\`  if you cannot resolve the failures
 
-The orchestrator will re-run verification after you push. If it passes, you're done. If it still fails and retries remain, you'll be invoked again with the new output.`;
+The orchestrator will re-run verification after your fix. If it passes, the orchestrator pushes + opens the PR. If it still fails and retries remain, you'll be invoked again with the new output.`;
 
 const FOLLOWUP_SUBAGENT_SYSTEM_PROMPT = `You are continuing work on a PR that has already been opened for a Linear ticket. Something happened on the PR that needs your response: a comment, a review, a line-anchored review comment, or a failed CI check. Your user prompt names which.
 
@@ -71,22 +71,33 @@ Do the work:
 1. Learn the project conventions FIRST. Read CLAUDE.md and README.md if they exist. Look at package.json scripts (or equivalent) to find lint, format, typecheck, and test commands. Skipping this step is not optional.
 2. Read any files referenced in the plan to ground your changes.
 3. Implement the changes described in the plan, matching the existing code style.
-4. Before committing, run the project's lint/format/typecheck/test commands you found in step 1. Fix any issues. Run the formatter — incidental formatting fixes to other files are fine and welcome.
+4. Run the project's lint/format/typecheck/test commands you found in step 1. Fix any issues. Run the formatter — incidental formatting fixes to other files are fine and welcome.
 5. Commit with a clear message. Multiple commits are fine.
-6. Push the branch: \`git push -u origin HEAD\`.
-7. Open a PR with \`gh pr create\` — use the ticket title as PR title; in the body, summarize the changes, list the verification commands you ran, and include a line "Linear: <ticket-identifier>" so Linear auto-links.
+6. **STOP HERE.** Do NOT push. Do NOT open a PR. The orchestrator independently runs the project's verification command against your worktree and only pushes + opens the PR when verification passes. This is the gate that keeps broken commits off the remote and out of CI.
+
+Output protocol — include a PR_BODY block once in your output with the markdown that should become the PR description:
+
+<!-- PR_BODY:
+## Summary
+- short bullets describing what changed and why
+
+## Test plan
+- the lint/format/typecheck/test commands you ran, with results
+-->
+
+Then your FINAL line must be exactly one of:
+- \`READY: <PR title>\`  if work is committed and ready for the orchestrator to verify + push. Pick a short conventional title (e.g. \`feat(scope): brief description\`).
+- \`BLOCKED: <reason>\`  if you cannot complete the task and a human needs to intervene.
 
 Hard rules:
-- Do NOT push to or modify the base branch (${config.BASE_BRANCH}).
+- Do NOT run \`git push\` — orchestrator handles it after verification passes.
+- Do NOT run \`gh pr create\` — orchestrator handles it.
+- Do NOT push to or modify the base branch.
 - Do NOT amend or force-push.
 - Do NOT touch .git/config or run \`git config --global\`.
 - Do NOT skip hooks (--no-verify) or signing.
 
-Output protocol — your FINAL line must be one of:
-- \`PR_URL: <url>\`  on success
-- \`BLOCKED: <reason>\`  if you cannot complete the task and a human needs to intervene
-
-Nothing after that line.`;
+Nothing after the final READY/BLOCKED line.`;
 
 interface ClaudeResult {
   result: string;
@@ -153,11 +164,48 @@ async function runExecution(issueId: string): Promise<void> {
     return;
   }
 
-  // Tell the subagent which base branch to target. For B2 children this is the
-  // parent's feature branch so all sibling PRs land in one testable place.
+  // For B2 children, mention the feature branch in the prompt as context, but
+  // the subagent no longer opens the PR — the orchestrator does. This is just
+  // informational so the subagent understands the merge target if it matters
+  // for the implementation.
   const baseNote = baseBranch === config.BASE_BRANCH
     ? ''
-    : `\n\nThis work targets base branch \`${baseBranch}\` (not \`${config.BASE_BRANCH}\`). Open the PR with \`gh pr create --base ${baseBranch}\` so it lands on the right branch.`;
+    : `\n\nThis work will land on base branch \`${baseBranch}\` — the orchestrator handles PR creation, you don't need to do anything with it.`;
+
+  // Multi-prereq children are branched off their FIRST listed dep. Their other
+  // deps' branches need to be merged in BEFORE work starts so the subagent
+  // actually sees all the prerequisite code.
+  let mergeNote = '';
+  if (ticket.parent_issue_id) {
+    const deps = readDependencyIds(ticket);
+    if (deps.length > 1) {
+      const siblings = listChildren(ticket.parent_issue_id);
+      const byPlanId = new Map<string, TicketRow>();
+      for (const s of siblings) if (s.plan_subtask_id) byPlanId.set(s.plan_subtask_id, s);
+      const otherBranches = deps
+        .slice(1)
+        .map((d) => byPlanId.get(d))
+        .filter((s): s is TicketRow => !!s?.identifier)
+        .map((s) => branchFor(s.identifier!));
+      if (otherBranches.length > 0) {
+        const refs = otherBranches.map((b) => `origin/${b}`).join(' ');
+        mergeNote = `
+
+## Multi-prerequisite merge — DO THIS FIRST
+
+Your worktree is branched off \`${baseBranch}\` (your first prerequisite). You ALSO depend on these sibling branches that must be merged in before you start your own work:
+${otherBranches.map((b) => `- \`${b}\``).join('\n')}
+
+Run, from this worktree:
+\`\`\`
+git fetch origin
+git merge ${refs}
+\`\`\`
+
+Resolve conflicts conservatively — prefer keeping both siblings' implementations intact and adapting your own work around them. If a merge conflict is genuinely unresolvable (would require redesigning a sibling's work), output \`BLOCKED: <reason>\` and stop.`;
+      }
+    }
+  }
 
   const userPrompt = `# Ticket ${ctx.identifier}: ${ctx.title}
 
@@ -165,9 +213,9 @@ async function runExecution(issueId: string): Promise<void> {
 ${ticket.last_plan}
 
 ## Ticket description (for reference)
-${ctx.description || '(none)'}${baseNote}
+${ctx.description || '(none)'}${baseNote}${mergeNote}
 
-Execute the plan. End with PR_URL: <url> or BLOCKED: <reason> on the final line.`;
+Execute the plan. End with READY: <PR title> or BLOCKED: <reason> on the final line, and include a PR_BODY block (see system prompt).`;
 
   const model = extractRecommendedModel(ticket.last_plan);
   console.log(`[executor] ${ctx.identifier}: spawning subagent (model=${model ?? 'default'})`);
@@ -198,22 +246,10 @@ Execute the plan. End with PR_URL: <url> or BLOCKED: <reason> on the final line.
   recordCost(issueId, result.total_cost_usd);
 
   const outcome = parseOutcome(result.result);
-  if (outcome.kind === 'pr') {
-    const prRef = parsePrUrl(outcome.url);
-    if (prRef) {
-      savePrInfo(issueId, outcome.url, prRef.repo, prRef.number, result.session_id);
-    } else {
-      console.warn(`[executor] ${ctx.identifier}: could not parse PR URL ${outcome.url} — follow-ups won't work`);
-    }
-
-    // PR exists — iteration moves to GitHub. Reflect that in Linear immediately,
-    // before verification runs. If verification later fails, the ticket is still
-    // in code-review territory (PR is open with the failing changes), so leaving
-    // it in "In Review" matches reality better than reverting to "In Progress".
-    void setIssueState(issueId, config.IN_REVIEW_STATE_NAME);
-
-    // Verify independently and auto-retry if it fails. The subagent's
-    // self-reported "I ran the checks" isn't trusted.
+  if (outcome.kind === 'ready') {
+    // Verification gates the push. Subagent has committed locally only; loop
+    // fix subagents until verification passes or we exhaust retries. Nothing
+    // hits the remote (and therefore CI) until verification is green.
     let sessionId = result.session_id;
     let verification = await runVerification(worktreePath, ctx.identifier);
     let attempts = 0;
@@ -237,7 +273,7 @@ Execute the plan. End with PR_URL: <url> or BLOCKED: <reason> on the final line.
       }
       attempts++;
       console.log(
-        `[executor] ${ctx.identifier}: verification failed, auto-fix attempt ${attempts}/${config.VERIFICATION_MAX_RETRIES}`,
+        `[executor] ${ctx.identifier}: verification failed, auto-fix attempt ${attempts}/${config.VERIFICATION_MAX_RETRIES} (pre-push)`,
       );
       const fix = await runVerificationFix(
         worktreePath,
@@ -258,12 +294,8 @@ Execute the plan. End with PR_URL: <url> or BLOCKED: <reason> on the final line.
       verification = await runVerification(worktreePath, ctx.identifier);
     }
 
-    // Persist the latest session id so future PR-comment follow-ups resume from the freshest point.
-    if (prRef && sessionId !== result.session_id) {
-      savePrInfo(issueId, outcome.url, prRef.repo, prRef.number, sessionId);
-    }
-
     if (!verification.ok) {
+      // Bail before pushing — keep the broken commits local for human inspection.
       upsertTicket(issueId, 'failed');
       const tail = verification.output.slice(-2000);
       const reason = budgetHit
@@ -273,23 +305,53 @@ Execute the plan. End with PR_URL: <url> or BLOCKED: <reason> on the final line.
           : `auto-fix exhausted ${attempts} retries`;
       await postComment(
         issueId,
-        `PR opened (${outcome.url}) but verification command \`${config.VERIFICATION_COMMAND}\` still failing — ${reason}. PR left open; worktree left at \`${worktreePath}\` for inspection.\n\nLast ${tail.length} chars of output:\n\`\`\`\n${tail}\n\`\`\`\n\n${budgetNote(issueId)}`,
+        `Verification failed before push — ${reason}. No PR was opened; commits are local only at \`${worktreePath}\`. Inspect, fix manually if you want to salvage, or click \`↻ execute\` to start over.\n\nLast ${tail.length} chars of output:\n\`\`\`\n${tail}\n\`\`\`\n\n${budgetNote(issueId)}`,
       );
-      console.error(`[executor] ${ctx.identifier}: verification ultimately failed after ${attempts} attempt(s)`);
+      console.error(`[executor] ${ctx.identifier}: verification ultimately failed after ${attempts} attempt(s); nothing pushed`);
       await rollupParentIfComplete(issueId);
       return;
     }
 
+    // Verification green — push and open the PR.
+    try {
+      await runGit(['push', '-u', 'origin', `HEAD:refs/heads/${branch}`], worktreePath);
+    } catch (err) {
+      await fail(issueId, ctx.identifier, `push failed after verification passed: ${(err as Error).message}`, worktreePath);
+      return;
+    }
+
+    const prBody = `${outcome.prBody || '(no PR body provided by subagent)'}\n\nLinear: ${ctx.identifier}`;
+    let prUrl: string;
+    try {
+      prUrl = await openPullRequest(worktreePath, baseBranch, outcome.prTitle, prBody);
+    } catch (err) {
+      await fail(
+        issueId,
+        ctx.identifier,
+        `gh pr create failed (branch ${branch} is pushed): ${(err as Error).message}`,
+        worktreePath,
+      );
+      return;
+    }
+
+    const prRef = parsePrUrl(prUrl);
+    if (prRef) {
+      savePrInfo(issueId, prUrl, prRef.repo, prRef.number, sessionId);
+    } else {
+      console.warn(`[executor] ${ctx.identifier}: could not parse PR URL ${prUrl} — follow-ups won't work`);
+    }
+
+    void setIssueState(issueId, config.IN_REVIEW_STATE_NAME);
     upsertTicket(issueId, 'done');
     await cleanupWorktree(worktreePath, branch);
     const retryNote = attempts > 0
-      ? ` after ${attempts} auto-fix ${attempts === 1 ? 'attempt' : 'attempts'}`
+      ? ` after ${attempts} pre-push auto-fix ${attempts === 1 ? 'attempt' : 'attempts'}`
       : '';
     await postComment(
       issueId,
-      `Execution complete${retryNote}. PR opened: ${outcome.url}\n\n${budgetNote(issueId)}`,
+      `Execution complete${retryNote}. PR opened: ${prUrl}\n\n${budgetNote(issueId)}`,
     );
-    console.log(`[executor] ${ctx.identifier}: PR opened ${outcome.url}${retryNote}`);
+    console.log(`[executor] ${ctx.identifier}: PR opened ${prUrl}${retryNote}`);
     await rollupParentIfComplete(issueId);
     return;
   }
@@ -308,7 +370,7 @@ Execute the plan. End with PR_URL: <url> or BLOCKED: <reason> on the final line.
   await fail(
     issueId,
     ctx.identifier,
-    `subagent finished without PR_URL or BLOCKED line. Last 500 chars:\n${result.result.slice(-500)}`,
+    `subagent finished without READY or BLOCKED line. Last 500 chars:\n${result.result.slice(-500)}`,
     worktreePath,
   );
 }
@@ -379,7 +441,7 @@ async function runVerificationFix(
 ${tail}
 \`\`\`
 
-This is auto-fix attempt ${attempt}/${maxAttempts}. Fix the failures, commit, and push. End with FIXED: <summary> or BLOCKED: <reason> on the final line.`;
+This is auto-fix attempt ${attempt}/${maxAttempts}. Fix the failures and commit. **DO NOT push** — the orchestrator will re-run verification and push only when it passes. End with FIXED: <summary> or BLOCKED: <reason> on the final line.`;
 
   let result: ClaudeResult;
   try {
@@ -566,19 +628,24 @@ function runSubagent(opts: SubagentOptions): Promise<ClaudeResult> {
 }
 
 type Outcome =
-  | { kind: 'pr'; url: string }
+  | { kind: 'ready'; prTitle: string; prBody: string }
   | { kind: 'blocked'; reason: string }
   | { kind: 'unknown' };
 
 function parseOutcome(text: string): Outcome {
+  // PR body block (HTML comment) — the subagent embeds the markdown that should
+  // become the PR description here.
+  const bodyMatch = /<!--\s*PR_BODY:\s*\n?([\s\S]+?)\n?\s*-->/i.exec(text);
+  const prBody = bodyMatch ? bodyMatch[1].trim() : '';
+
   const lines = text.trimEnd().split('\n');
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim();
     if (!line) continue;
-    const prMatch = line.match(/^PR_URL:\s*(\S+)/);
-    if (prMatch) return { kind: 'pr', url: prMatch[1] };
+    const ready = line.match(/^READY:\s*(.+)/);
+    if (ready) return { kind: 'ready', prTitle: ready[1].trim(), prBody };
     const blockedMatch = line.match(/^BLOCKED:\s*(.+)/);
-    if (blockedMatch) return { kind: 'blocked', reason: blockedMatch[1] };
+    if (blockedMatch) return { kind: 'blocked', reason: blockedMatch[1].trim() };
     break;
   }
   return { kind: 'unknown' };
@@ -899,6 +966,49 @@ async function tryPostPrComment(
   }
 }
 
+/** Open the PR from inside the worktree via gh. Returns the PR URL gh prints. */
+function openPullRequest(
+  worktreePath: string,
+  baseBranch: string,
+  title: string,
+  body: string,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      'gh',
+      ['pr', 'create', '--base', baseBranch, '--title', title, '--body-file', '-'],
+      {
+        cwd: worktreePath,
+        env: {
+          ...process.env,
+          ...(config.GITHUB_TOKEN
+            ? { GITHUB_TOKEN: config.GITHUB_TOKEN, GH_TOKEN: config.GITHUB_TOKEN }
+            : {}),
+        },
+      },
+    );
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (c) => { stdout += c; });
+    child.stderr.on('data', (c) => { stderr += c; });
+    child.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`gh pr create exited ${code}: ${stderr}`));
+        return;
+      }
+      // gh prints the PR URL as the last non-empty line of stdout.
+      const url = stdout.split('\n').map((l) => l.trim()).filter(Boolean).pop() ?? '';
+      if (!/github\.com\/[^/]+\/[^/]+\/pull\/\d+/.test(url)) {
+        reject(new Error(`gh pr create did not return a PR URL. stdout:\n${stdout}\nstderr:\n${stderr}`));
+        return;
+      }
+      resolve(url);
+    });
+    child.on('error', reject);
+    child.stdin.end(body);
+  });
+}
+
 function postPrComment(repo: string, number: number, body: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn(
@@ -975,12 +1085,75 @@ async function prepareFollowupWorktree(branch: string, worktreePath: string): Pr
   await runGit(['worktree', 'add', '--detach', worktreePath, `origin/${branch}`]);
 }
 
+/** Walk a split parent's waiting children. For each, decide:
+ *  - all prereqs done → flip 'waiting' → 'executing' and dispatch
+ *  - any prereq failed (or vanished) → cascade-fail this child, post a note
+ *  Called whenever a sibling reaches a terminal state. */
+async function dispatchReadyDependents(parentIssueId: string): Promise<void> {
+  const siblings = listChildren(parentIssueId);
+  if (siblings.length === 0) return;
+
+  const byPlanId = new Map<string, TicketRow>();
+  for (const s of siblings) {
+    if (s.plan_subtask_id) byPlanId.set(s.plan_subtask_id, s);
+  }
+
+  for (const sibling of siblings) {
+    if (sibling.state !== 'waiting') continue;
+    const deps = readDependencyIds(sibling);
+    if (deps.length === 0) {
+      // Shouldn't happen — waiting state implies deps. Be defensive: dispatch.
+      setChildExecuting(sibling.issue_id);
+      void dispatchExecution(sibling.issue_id).catch((err) =>
+        console.error(`[deps] dispatch failed for ${sibling.issue_id}:`, err),
+      );
+      continue;
+    }
+
+    const resolved = deps.map((d) => byPlanId.get(d));
+    if (resolved.some((r) => !r)) {
+      upsertTicket(sibling.issue_id, 'failed');
+      await postComment(
+        sibling.issue_id,
+        `Cannot start: a declared prerequisite id was not found among siblings. Declared deps: ${deps.join(', ')}.`,
+      );
+      continue;
+    }
+
+    const failedPrereq = resolved.find((r) => r!.state === 'failed');
+    if (failedPrereq) {
+      upsertTicket(sibling.issue_id, 'failed');
+      const fid = failedPrereq!.identifier ?? failedPrereq!.issue_id.slice(0, 8);
+      await postComment(
+        sibling.issue_id,
+        `Cancelled: prerequisite ${fid} failed; cascading failure.\n\nFix the prerequisite and use \`↻ execute\` on it to retry; this ticket will need to be reset to \`waiting\` and re-dispatched manually for now.`,
+      );
+      continue;
+    }
+
+    if (resolved.every((r) => r!.state === 'done')) {
+      setChildExecuting(sibling.issue_id);
+      console.log(
+        `[deps] ${sibling.identifier ?? sibling.issue_id}: all ${deps.length} prereq(s) done — dispatching`,
+      );
+      void dispatchExecution(sibling.issue_id).catch((err) =>
+        console.error(`[deps] dispatch failed for ${sibling.issue_id}:`, err),
+      );
+    }
+  }
+}
+
 /** Called after a child reaches a terminal state. If this was the last sibling
  *  to finish, post a rollup comment on the parent and mark it 'done' so we don't
  *  post again. No-op for tickets that aren't children. */
 async function rollupParentIfComplete(childIssueId: string): Promise<void> {
   const child = getTicket(childIssueId);
   if (!child?.parent_issue_id) return;
+
+  // First, propagate the terminal state to any waiting siblings. This may
+  // dispatch new work OR cascade-fail siblings, both of which affect the
+  // "all siblings terminal?" check below.
+  await dispatchReadyDependents(child.parent_issue_id);
 
   const parent = getTicket(child.parent_issue_id);
   // 'split' is the post-split state; if it's already 'done' we've rolled up.
@@ -994,8 +1167,14 @@ async function rollupParentIfComplete(childIssueId: string): Promise<void> {
   upsertTicket(child.parent_issue_id, 'done');
 
   // Fetch each child's Linear identifier for the rollup. One call per child —
-  // acceptable for the one-time rollup posting.
+  // acceptable for the one-time rollup posting. Also annotate each line with
+  // the child's actual PR target (`base_branch`) because with dependency-aware
+  // splitting, dependents target their prereq's branch (stacked PRs), not the
+  // feature branch.
+  const featureBranch = parent.base_branch;
   const lines: string[] = [];
+  const targetsFeature: string[] = [];
+  const targetsSibling: string[] = [];
   for (const s of siblings) {
     let identifier = s.issue_id.slice(0, 8);
     try {
@@ -1006,7 +1185,12 @@ async function rollupParentIfComplete(childIssueId: string): Promise<void> {
     }
     const icon = s.state === 'done' ? '✅' : '❌';
     const ref = s.pr_url ?? '_no PR_';
-    lines.push(`${icon} ${identifier} — ${ref}`);
+    const target = s.base_branch ? ` → \`${s.base_branch}\`` : '';
+    lines.push(`${icon} ${identifier} — ${ref}${target}`);
+    if (s.state === 'done' && s.pr_url) {
+      if (s.base_branch === featureBranch) targetsFeature.push(identifier);
+      else if (s.base_branch) targetsSibling.push(identifier);
+    }
   }
 
   const succeeded = siblings.filter((s) => s.state === 'done').length;
@@ -1016,17 +1200,25 @@ async function rollupParentIfComplete(childIssueId: string): Promise<void> {
       ? `All ${siblings.length} subtasks finished successfully.`
       : `${succeeded}/${siblings.length} subtasks succeeded, ${failed} failed.`;
 
-  // If this split used a feature branch, point the reviewer at the integrated
-  // result they can test in one place.
-  const featureBranch = parent.base_branch;
-  const featureNote = featureBranch
-    ? `\n\nAll child PRs target feature branch \`${featureBranch}\`. Once they're merged you can review the integrated result there, then open a PR \`${featureBranch}\` → \`${config.BASE_BRANCH}\`.`
-    : '';
+  // Merge guidance. If any dependents produced stacked PRs, spell out the
+  // bottom-up merge order; otherwise fall back to the simple "merge all → merge
+  // feature branch" message.
+  let mergeNote = '';
+  if (featureBranch) {
+    if (targetsSibling.length > 0) {
+      mergeNote = `\n\nChildren's PRs are stacked (dependents target their prerequisite's branch, not \`${featureBranch}\`). Merge **bottom-up**:
+1. Merge the PRs targeting \`${featureBranch}\` first (${targetsFeature.length ? targetsFeature.join(', ') : 'none'}).
+2. If your repo deletes branches on merge, GitHub auto-retargets dependent PRs (${targetsSibling.join(', ')}) up the stack as their bases disappear. Otherwise, merge them in dependency order manually.
+3. Once only the feature branch remains, open \`${featureBranch}\` → \`${config.BASE_BRANCH}\`.`;
+    } else {
+      mergeNote = `\n\nAll child PRs target \`${featureBranch}\` directly. Merge them in any order, then open \`${featureBranch}\` → \`${config.BASE_BRANCH}\`.`;
+    }
+  }
 
   try {
     await postComment(
       child.parent_issue_id,
-      `${summary}\n\n${lines.join('\n')}${featureNote}\n\n${budgetNote(child.parent_issue_id)}`,
+      `${summary}\n\n${lines.join('\n')}${mergeNote}\n\n${budgetNote(child.parent_issue_id)}`,
     );
   } catch (err) {
     console.error(`[rollup] failed to post rollup comment on parent ${child.parent_issue_id}:`, err);
@@ -1043,9 +1235,37 @@ async function splitIntoSubtasks(
     return;
   }
 
-  // Create a single feature branch off BASE_BRANCH that all sibling PRs will
-  // target. Reviewing children's PRs merges them here; the feature branch
-  // becomes the single testable, reviewable state for the whole ticket.
+  // Validate planner-supplied ids: uniqueness, no unknown deps, no cycles.
+  const idCount = new Map<string, number>();
+  for (const s of subtasks) idCount.set(s.id, (idCount.get(s.id) ?? 0) + 1);
+  const duplicates = [...idCount.entries()].filter(([, n]) => n > 1).map(([k]) => k);
+  if (duplicates.length) {
+    await fail(
+      parentIssueId,
+      parentCtx.identifier,
+      `duplicate subtask id(s) in plan: ${duplicates.join(', ')}. Each SUBTASK_START needs a unique id.`,
+    );
+    return;
+  }
+  const topo = topoSort(subtasks);
+  if (topo.error === 'unknown_dep') {
+    await fail(
+      parentIssueId,
+      parentCtx.identifier,
+      `subtask "${topo.unknownDep!.from}" depends on unknown id "${topo.unknownDep!.to}". Fix the plan and re-approve.`,
+    );
+    return;
+  }
+  if (topo.error === 'cycle') {
+    await fail(
+      parentIssueId,
+      parentCtx.identifier,
+      `dependency cycle in subtasks: ${(topo.cyclePath ?? []).join(' → ')}. Fix the plan and re-approve.`,
+    );
+    return;
+  }
+
+  // Feature branch off BASE_BRANCH. All sibling PRs ultimately land here.
   const featureBranch = branchFor(parentCtx.identifier);
   try {
     await ensureFeatureBranchOnRemote(featureBranch);
@@ -1059,55 +1279,115 @@ async function splitIntoSubtasks(
     return;
   }
 
-  const created: Array<{ id: string; identifier: string; title: string }> = [];
-  const failures: Array<{ title: string; reason: string }> = [];
+  // Create Linear issues + DB rows in topo order so a dependent's prereq always
+  // has its branch name available when we resolve base_branch.
+  const created = new Map<string, { id: string; identifier: string; title: string }>();
+  const failures: Array<{ id: string; title: string; reason: string }> = [];
+  const subById = new Map(subtasks.map((s) => [s.id, s]));
 
-  for (const sub of subtasks) {
-    try {
-      const child = await createChildIssue({
-        teamId: parentCtx.teamId,
-        parentId: parentIssueId,
-        title: sub.title,
-        description: sub.body,
-      });
-      if (!child) {
-        failures.push({ title: sub.title, reason: 'Linear createIssue returned no issue' });
-        continue;
+  for (const wave of topo.order) {
+    for (const subId of wave) {
+      const sub = subById.get(subId)!;
+      try {
+        const child = await createChildIssue({
+          teamId: parentCtx.teamId,
+          parentId: parentIssueId,
+          title: sub.title,
+          description: sub.body,
+        });
+        if (!child) {
+          failures.push({ id: subId, title: sub.title, reason: 'Linear createIssue returned no issue' });
+          continue;
+        }
+
+        // Bake the model override (if any) into the child's plan so extractRecommendedModel finds it.
+        const planBody = sub.model
+          ? `${sub.body}\n\n**Recommended execution model:** ${sub.model}`
+          : sub.body;
+
+        // Decide base branch + initial state based on prereqs.
+        const prereqEntries = sub.depends.map((d) => created.get(d));
+        const haveAllPrereqs = prereqEntries.every(Boolean);
+        let childBaseBranch: string;
+        let initialState: 'executing' | 'waiting';
+        if (sub.depends.length === 0) {
+          childBaseBranch = featureBranch;
+          initialState = 'executing';
+        } else if (!haveAllPrereqs) {
+          // A prereq failed to create earlier in this wave loop — cascade.
+          failures.push({
+            id: subId,
+            title: sub.title,
+            reason: `prerequisite subtask failed to create — cannot dispatch`,
+          });
+          continue;
+        } else {
+          childBaseBranch = branchFor(prereqEntries[0]!.identifier);
+          initialState = 'waiting';
+        }
+
+        createChildTicket({
+          childIssueId: child.id,
+          parentIssueId,
+          lastPlan: planBody,
+          baseBranch: childBaseBranch,
+          planSubtaskId: subId,
+          planDependencyIds: sub.depends,
+          initialState,
+        });
+        created.set(subId, { id: child.id, identifier: child.identifier, title: sub.title });
+        // Children skip approval — flip to In Progress.
+        void setIssueState(child.id, config.IN_PROGRESS_STATE_NAME);
+        console.log(
+          `[split] ${parentCtx.identifier} → ${child.identifier}: ${sub.title} (id=${subId}, deps=[${sub.depends.join(',')}], base=${childBaseBranch}, state=${initialState})`,
+        );
+      } catch (err) {
+        failures.push({ id: subId, title: sub.title, reason: (err as Error).message });
       }
-      // Bake the model override (if any) into the child's plan so extractRecommendedModel finds it.
-      const planBody = sub.model
-        ? `${sub.body}\n\n**Recommended execution model:** ${sub.model}`
-        : sub.body;
-      createChildTicket(child.id, parentIssueId, planBody, featureBranch);
-      created.push({ id: child.id, identifier: child.identifier, title: sub.title });
-      // Children skip approval, so flip them straight to In Progress.
-      void setIssueState(child.id, config.IN_PROGRESS_STATE_NAME);
-      console.log(`[split] ${parentCtx.identifier} → ${child.identifier}: ${sub.title}`);
-    } catch (err) {
-      failures.push({ title: sub.title, reason: (err as Error).message });
     }
   }
 
-  if (created.length === 0) {
+  if (created.size === 0) {
     await fail(
       parentIssueId,
       parentCtx.identifier,
-      `Failed to create any child subtasks:\n${failures.map((f) => `- ${f.title}: ${f.reason}`).join('\n')}`,
+      `Failed to create any child subtasks:\n${failures.map((f) => `- ${f.title} (${f.id}): ${f.reason}`).join('\n')}`,
     );
     return;
   }
 
   upsertTicket(parentIssueId, 'split');
-  const childList = created.map((c) => `- ${c.identifier}: ${c.title}`).join('\n');
+
+  // Wave-grouped summary so the user sees the dispatch order at a glance.
+  const summaryLines: string[] = [];
+  topo.order.forEach((wave, idx) => {
+    const items = wave
+      .map((subId) => {
+        const child = created.get(subId);
+        const sub = subById.get(subId);
+        if (!child || !sub) return null;
+        const depsLabel = sub.depends.length ? ` _(deps: ${sub.depends.join(', ')})_` : '';
+        return `- ${child.identifier}: ${sub.title}${depsLabel}`;
+      })
+      .filter(Boolean) as string[];
+    if (items.length === 0) return;
+    summaryLines.push(`**Wave ${idx + 1}** ${idx === 0 ? '(dispatches immediately)' : '(waits for prior waves)'}:`);
+    summaryLines.push(...items);
+  });
   const failTail = failures.length
-    ? `\n\n⚠️ ${failures.length} subtask${failures.length === 1 ? '' : 's'} failed to create:\n${failures.map((f) => `- ${f.title}: ${f.reason}`).join('\n')}`
+    ? `\n\n⚠️ ${failures.length} subtask${failures.length === 1 ? '' : 's'} failed to create:\n${failures.map((f) => `- ${f.title} (${f.id}): ${f.reason}`).join('\n')}`
     : '';
   await postComment(
     parentIssueId,
-    `Split into ${created.length} subtask${created.length === 1 ? '' : 's'}, all targeting feature branch \`${featureBranch}\` (off \`${config.BASE_BRANCH}\`):\n${childList}${failTail}\n\nEach child executes independently — no further approval needed. Children's PRs land on the feature branch so you can review and test them together; merge the feature branch to \`${config.BASE_BRANCH}\` when satisfied.\n\n${budgetNote(parentIssueId)}`,
+    `Split into ${created.size} subtask${created.size === 1 ? '' : 's'}, all ultimately targeting feature branch \`${featureBranch}\` (off \`${config.BASE_BRANCH}\`):\n\n${summaryLines.join('\n')}${failTail}\n\nDependents auto-dispatch when their prerequisites complete. Children's PRs land in a stack on the feature branch — merge bottom-up to consolidate, then open \`${featureBranch}\` → \`${config.BASE_BRANCH}\`.\n\n${budgetNote(parentIssueId)}`,
   );
 
-  for (const child of created) {
+  // Dispatch only the first wave (the no-deps children). Subsequent waves
+  // auto-dispatch from dispatchReadyDependents as prereqs complete.
+  const firstWave = topo.order[0] ?? [];
+  for (const subId of firstWave) {
+    const child = created.get(subId);
+    if (!child) continue;
     void dispatchExecution(child.id).catch((err) => {
       console.error(`[split] ${parentCtx.identifier} → ${child.identifier}: dispatch failed:`, err);
     });

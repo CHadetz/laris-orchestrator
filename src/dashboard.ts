@@ -180,6 +180,7 @@ export const DASHBOARD_HTML = String.raw`<!doctype html>
   .pill.done { color: var(--green); border-color: color-mix(in srgb, var(--green) 30%, transparent); background: color-mix(in srgb, var(--green) 10%, transparent); }
   .pill.failed { color: var(--red); border-color: color-mix(in srgb, var(--red) 30%, transparent); background: color-mix(in srgb, var(--red) 10%, transparent); }
   .pill.split { color: var(--purple); border-color: color-mix(in srgb, var(--purple) 30%, transparent); background: color-mix(in srgb, var(--purple) 10%, transparent); }
+  .pill.waiting { color: var(--muted); border-color: var(--border); background: var(--panel-2); }
   .ticket { padding: 12px 14px; border-bottom: 1px solid var(--border); display: flex; gap: 12px; align-items: flex-start; }
   .ticket:last-child { border-bottom: 0; }
   .ticket.child { padding-left: 38px; background: color-mix(in srgb, var(--panel-2) 50%, transparent); }

@@ -38,6 +38,11 @@ for (const col of [
   'identifier TEXT',
   'title TEXT',
   'base_branch TEXT',
+  // B2 dependency-aware splitting:
+  // - plan_subtask_id: the planner-assigned local id ("schema", "service", ...)
+  // - plan_dependency_ids: JSON array of sibling plan ids this child must come after
+  'plan_subtask_id TEXT',
+  'plan_dependency_ids TEXT',
 ]) {
   try {
     db.exec(`ALTER TABLE tickets ADD COLUMN ${col}`);
@@ -48,7 +53,7 @@ for (const col of [
 
 db.exec('CREATE INDEX IF NOT EXISTS idx_tickets_pr ON tickets(pr_repo, pr_number)');
 
-export type TicketState = 'planning' | 'executing' | 'done' | 'failed' | 'split';
+export type TicketState = 'planning' | 'executing' | 'done' | 'failed' | 'split' | 'waiting';
 
 export interface TicketRow {
   issue_id: string;
@@ -67,6 +72,10 @@ export interface TicketRow {
   /** Per-ticket base branch override. Used by B2 child tickets so their PRs
    *  target the parent's feature branch instead of the configured BASE_BRANCH. */
   base_branch: string | null;
+  /** Planner-local id for this child within its split ("schema", "service"). */
+  plan_subtask_id: string | null;
+  /** JSON-encoded array of sibling plan ids this child must come after. */
+  plan_dependency_ids: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -223,23 +232,60 @@ export function listRecentEvents(limit = 100): EventRow[] {
     .all(limit) as EventRow[];
 }
 
-/** Create a child ticket row (for B2 subtask splitting) with last_plan pre-populated. */
-export function createChildTicket(
-  childIssueId: string,
-  parentIssueId: string,
-  lastPlan: string,
-  baseBranch: string,
-): void {
+/** Create a child ticket row (for B2 subtask splitting) with last_plan pre-populated.
+ *  initialState is 'executing' for children with no deps (dispatched immediately) or
+ *  'waiting' for children that have prereqs. */
+export function createChildTicket(opts: {
+  childIssueId: string;
+  parentIssueId: string;
+  lastPlan: string;
+  baseBranch: string;
+  planSubtaskId: string;
+  planDependencyIds: string[];
+  initialState: 'executing' | 'waiting';
+}): void {
   db.prepare(
-    `INSERT INTO tickets (issue_id, state, last_plan, parent_issue_id, base_branch)
-     VALUES (?, 'executing', ?, ?, ?)
+    `INSERT INTO tickets (
+       issue_id, state, last_plan, parent_issue_id, base_branch,
+       plan_subtask_id, plan_dependency_ids
+     )
+     VALUES (?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(issue_id) DO UPDATE SET
-       state = 'executing',
+       state = excluded.state,
        last_plan = excluded.last_plan,
        parent_issue_id = excluded.parent_issue_id,
        base_branch = excluded.base_branch,
+       plan_subtask_id = excluded.plan_subtask_id,
+       plan_dependency_ids = excluded.plan_dependency_ids,
        updated_at = unixepoch()`,
-  ).run(childIssueId, lastPlan, parentIssueId, baseBranch);
+  ).run(
+    opts.childIssueId,
+    opts.initialState,
+    opts.lastPlan,
+    opts.parentIssueId,
+    opts.baseBranch,
+    opts.planSubtaskId,
+    JSON.stringify(opts.planDependencyIds),
+  );
+}
+
+/** Flip a waiting child to executing (called when prereqs are all done). */
+export function setChildExecuting(issueId: string): void {
+  db.prepare(`
+    UPDATE tickets SET state = 'executing', updated_at = unixepoch()
+    WHERE issue_id = ? AND state = 'waiting'
+  `).run(issueId);
+}
+
+/** Parse the stored dependency-id JSON into a string[]. Safe on null/garbage. */
+export function readDependencyIds(ticket: Pick<TicketRow, 'plan_dependency_ids'>): string[] {
+  if (!ticket.plan_dependency_ids) return [];
+  try {
+    const v = JSON.parse(ticket.plan_dependency_ids);
+    return Array.isArray(v) ? v.map(String) : [];
+  } catch {
+    return [];
+  }
 }
 
 /** Persist the parent's chosen feature branch so the rollup comment can mention it. */
